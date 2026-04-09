@@ -1,71 +1,130 @@
+// Package query implements the core query loop: user input → LLM → tool
+// execution → repeat until the model stops calling tools.
 package query
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 
+	"github.com/noknov/mini-claude-code/internal/compact"
 	"github.com/noknov/mini-claude-code/internal/config"
 	ctxinfo "github.com/noknov/mini-claude-code/internal/context"
+	"github.com/noknov/mini-claude-code/internal/hooks"
 	"github.com/noknov/mini-claude-code/internal/permission"
+	"github.com/noknov/mini-claude-code/internal/prompt"
 	"github.com/noknov/mini-claude-code/internal/provider"
+	"github.com/noknov/mini-claude-code/internal/retry"
 	"github.com/noknov/mini-claude-code/internal/session"
 	"github.com/noknov/mini-claude-code/internal/tool"
 	"github.com/noknov/mini-claude-code/internal/tools"
 	"github.com/noknov/mini-claude-code/internal/ui"
 )
 
-// Engine orchestrates the query loop: user input → API → tool execution → repeat.
+// ---------------------------------------------------------------------------
+// Engine
+// ---------------------------------------------------------------------------
+
+// Engine orchestrates the query loop.
 type Engine struct {
-	provider provider.Provider
-	session  *session.Session
-	ctx      *ctxinfo.Info
-	cfg      *config.Config
-	registry *tool.Registry
-	perm     *permission.Manager
+	provider   provider.Provider
+	session    *session.Session
+	ctx        *ctxinfo.Info
+	cfg        *config.Config
+	registry   *tool.Registry
+	perm       *permission.Manager
+	hooks      *hooks.Runner
+	compactor  *compact.Compactor
+	retryCfg   retry.Config
+	cancelFunc context.CancelFunc // set per-turn for Ctrl+C interruption
 }
 
-func NewEngine(prov provider.Provider, sess *session.Session, ctx *ctxinfo.Info, cfg *config.Config) *Engine {
-	return &Engine{
-		provider: prov,
-		session:  sess,
-		ctx:      ctx,
-		cfg:      cfg,
-		registry: tools.NewDefaultRegistry(),
-		perm:     permission.NewManager(cfg.PermissionMode),
+func NewEngine(
+	prov provider.Provider,
+	sess *session.Session,
+	ctx *ctxinfo.Info,
+	cfg *config.Config,
+) *Engine {
+	e := &Engine{
+		provider:  prov,
+		session:   sess,
+		ctx:       ctx,
+		cfg:       cfg,
+		registry:  tools.NewDefaultRegistry(ctx.Skills, ctx.MCPClient),
+		perm:      permission.NewManager(cfg.PermissionMode, ctx.Settings.Permissions),
+		hooks:     hooks.NewRunner(ctx.Settings, cfg.WorkDir),
+		compactor: compact.New(prov),
+		retryCfg:  retry.DefaultConfig(),
+	}
+
+	// Wire the agent tool callback
+	e.wireAgentTool()
+
+	return e
+}
+
+// wireAgentTool connects the AgentTool to the engine's execution capability.
+func (e *Engine) wireAgentTool() {
+	if t, ok := e.registry.Get("Agent"); ok {
+		if at, ok := t.(*tools.AgentTool); ok {
+			at.OnSpawn = func(prompt, agentName string) (string, error) {
+				// TODO: implement full subagent execution with isolated context
+				return fmt.Sprintf("[Agent spawned with prompt: %s]", truncate(prompt, 200)), nil
+			}
+		}
 	}
 }
 
+// ---------------------------------------------------------------------------
+// REPLEngine interface
+// ---------------------------------------------------------------------------
+
 func (e *Engine) SessionInfo() (inputTokens, outputTokens int, cost float64) {
-	return e.session.InputTokens, e.session.OutputTokens, e.session.EstimateCost()
+	in, out := e.session.TotalTokens()
+	return in, out, e.session.EstimateCost()
 }
 
 func (e *Engine) ClearSession()     { e.session.Clear() }
 func (e *Engine) SetModel(m string) { e.provider.SetModel(m) }
 func (e *Engine) GetModel() string  { return e.provider.Model() }
 
+// Cancel aborts the current in-flight API call.
+func (e *Engine) Cancel() {
+	if e.cancelFunc != nil {
+		e.cancelFunc()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Main query loop
+// ---------------------------------------------------------------------------
+
 // Run processes a user message through the full tool-use loop.
 func (e *Engine) Run(userInput string, terminal *ui.Terminal) {
 	e.session.AddUserMessage(userInput)
+	e.autoCompactIfNeeded(terminal)
 
 	for {
-		resp := e.callAPI(context.Background(), terminal)
+		resp := e.callAPI(terminal)
 		if resp == nil {
 			return
 		}
 
 		e.session.AddAssistantMessage(resp.ContentBlocks)
-		e.session.UpdateUsage(resp.InputTokens, resp.OutputTokens)
+		e.session.UpdateUsage(resp.Model, resp.InputTokens, resp.OutputTokens)
 
-		toolCalls := extractToolCalls(resp.ContentBlocks)
-		if len(toolCalls) == 0 {
+		calls := extractToolCalls(resp.ContentBlocks)
+		if len(calls) == 0 {
 			return
 		}
 
-		e.executeTools(toolCalls, terminal)
+		e.executeTools(calls, terminal)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Tool execution
+// ---------------------------------------------------------------------------
 
 func (e *Engine) executeTools(calls []toolCall, terminal *ui.Terminal) {
 	for _, tc := range calls {
@@ -73,40 +132,77 @@ func (e *Engine) executeTools(calls []toolCall, terminal *ui.Terminal) {
 
 		t, ok := e.registry.Get(tc.Name)
 		if !ok {
-			e.session.AddToolResult(tc.ID, fmt.Sprintf("Unknown tool: %s", tc.Name), true)
-			terminal.PrintToolError(tc.Name, fmt.Errorf("unknown tool: %s", tc.Name))
+			e.recordToolError(tc.ID, tc.Name, "unknown tool", terminal)
 			continue
 		}
 
-		if t.NeedsPermission(tc.Input) {
-			desc := t.FormatPermissionRequest(tc.Input)
-			if !e.perm.Check(tc.Name, desc, terminal) {
-				e.session.AddToolResult(tc.ID, "Permission denied by user", true)
-				terminal.PrintToolDenied(tc.Name)
-				continue
-			}
+		if !e.checkPermission(t, tc, terminal) {
+			e.session.AddToolResult(tc.ID, "Permission denied by user", true)
+			terminal.PrintToolDenied(tc.Name)
+			continue
 		}
 
-		result, err := e.registry.Execute(tc.Name, tc.Input, e.cfg.WorkDir)
-		if err != nil {
-			e.session.AddToolResult(tc.ID, err.Error(), true)
-			terminal.PrintToolError(tc.Name, err)
-		} else {
-			e.session.AddToolResult(tc.ID, result, false)
-			terminal.PrintToolResult(tc.Name, result)
-		}
+		e.runPostHooksAndRecord(t, tc, terminal)
 	}
 }
 
-func (e *Engine) callAPI(ctx context.Context, terminal *ui.Terminal) *provider.Response {
+func (e *Engine) checkPermission(t tool.Tool, tc toolCall, terminal *ui.Terminal) bool {
+	if !t.NeedsPermission(tc.Input) {
+		return true
+	}
+
+	// Run pre-tool hooks
+	hookResults := e.hooks.Run(hooks.PreToolUse, tc.Name, tc.Input)
+	hookDecision := hooks.ResolvePermission(hookResults)
+
+	desc := t.FormatPermissionRequest(tc.Input)
+	return e.perm.CheckWithHookDecision(hookDecision, tc.Name, desc, terminal)
+}
+
+func (e *Engine) runPostHooksAndRecord(t tool.Tool, tc toolCall, terminal *ui.Terminal) {
+	result, err := e.registry.Execute(tc.Name, tc.Input, e.cfg.WorkDir)
+
+	// Run post-tool hooks
+	e.hooks.Run(hooks.PostToolUse, tc.Name, tc.Input)
+
+	if err != nil {
+		e.session.AddToolResult(tc.ID, err.Error(), true)
+		terminal.PrintToolError(tc.Name, err)
+	} else {
+		e.session.AddToolResult(tc.ID, result, false)
+		terminal.PrintToolResult(tc.Name, result)
+	}
+}
+
+func (e *Engine) recordToolError(id, name, msg string, terminal *ui.Terminal) {
+	e.session.AddToolResult(id, fmt.Sprintf("%s: %s", name, msg), true)
+	terminal.PrintToolError(name, fmt.Errorf("%s", msg))
+}
+
+// ---------------------------------------------------------------------------
+// API call with retry + streaming
+// ---------------------------------------------------------------------------
+
+func (e *Engine) callAPI(terminal *ui.Terminal) *provider.Response {
+	ctx, cancel := context.WithCancel(context.Background())
+	e.cancelFunc = cancel
+	defer func() { e.cancelFunc = nil }()
+
 	req := provider.Request{
 		SystemPrompt: e.buildSystemPrompt(),
 		Messages:     e.session.Messages,
 		Tools:        e.buildToolDefs(),
 	}
 
-	eventCh, errCh := e.provider.SendStream(ctx, req)
+	eventCh, errCh := retry.SendStreamWithRetry(ctx, e.provider, req, e.retryCfg)
+	return e.consumeStream(eventCh, errCh, terminal)
+}
 
+func (e *Engine) consumeStream(
+	eventCh <-chan provider.StreamEvent,
+	errCh <-chan error,
+	terminal *ui.Terminal,
+) *provider.Response {
 	var resp provider.Response
 	streaming := false
 
@@ -119,29 +215,7 @@ func (e *Engine) callAPI(ctx context.Context, terminal *ui.Terminal) *provider.R
 				}
 				return &resp
 			}
-			switch evt.Type {
-			case "text":
-				if evt.Text != "" {
-					if !streaming {
-						terminal.StartStreaming()
-						streaming = true
-					}
-					terminal.StreamText(evt.Text)
-				}
-			case "tool_use_start":
-				if streaming {
-					terminal.StopStreaming()
-					streaming = false
-				}
-			case "done":
-				if streaming {
-					terminal.StopStreaming()
-					streaming = false
-				}
-				if evt.Response != nil {
-					resp = *evt.Response
-				}
-			}
+			streaming = e.handleStreamEvent(evt, &resp, streaming, terminal)
 
 		case err, ok := <-errCh:
 			if ok && err != nil {
@@ -153,6 +227,84 @@ func (e *Engine) callAPI(ctx context.Context, terminal *ui.Terminal) *provider.R
 			}
 		}
 	}
+}
+
+func (e *Engine) handleStreamEvent(
+	evt provider.StreamEvent,
+	resp *provider.Response,
+	streaming bool,
+	terminal *ui.Terminal,
+) bool {
+	switch evt.Type {
+	case "text":
+		if evt.Text != "" {
+			if !streaming {
+				terminal.StartStreaming()
+				streaming = true
+			}
+			terminal.StreamText(evt.Text)
+		}
+	case "tool_use_start":
+		if streaming {
+			terminal.StopStreaming()
+			streaming = false
+		}
+	case "done":
+		if streaming {
+			terminal.StopStreaming()
+			streaming = false
+		}
+		if evt.Response != nil {
+			*resp = *evt.Response
+		}
+	}
+	return streaming
+}
+
+// ---------------------------------------------------------------------------
+// Auto-compaction
+// ---------------------------------------------------------------------------
+
+func (e *Engine) autoCompactIfNeeded(terminal *ui.Terminal) {
+	if !e.ctx.Settings.IsAutoCompactEnabled() {
+		return
+	}
+	if !e.compactor.ShouldCompact(e.session.Messages) {
+		return
+	}
+
+	terminal.PrintInfo("Auto-compacting conversation...")
+	e.hooks.Run(hooks.PreCompact, "", nil)
+
+	msgs, err := e.compactor.Compact(context.Background(), e.session.Messages)
+	if err != nil {
+		terminal.PrintError(fmt.Errorf("compact failed: %w", err))
+		return
+	}
+
+	e.session.SetMessages(msgs)
+	e.hooks.Run(hooks.PostCompact, "", nil)
+	terminal.PrintSuccess("Conversation compacted")
+}
+
+// ---------------------------------------------------------------------------
+// Prompt + tool definitions
+// ---------------------------------------------------------------------------
+
+func (e *Engine) buildSystemPrompt() string {
+	return prompt.Build(&prompt.Context{
+		OS:             e.ctx.OS,
+		Shell:          e.ctx.Shell,
+		WorkDir:        e.ctx.WorkDir,
+		Date:           e.ctx.Date,
+		GitStatus:      e.ctx.GitStatus,
+		MemoryFiles:    e.ctx.MemoryFiles,
+		Rules:          e.ctx.Rules,
+		Skills:         e.ctx.Skills,
+		Agents:         e.ctx.Agents,
+		MCPClient:      e.ctx.MCPClient,
+		OutputLanguage: e.ctx.Settings.OutputLanguage,
+	})
 }
 
 func (e *Engine) buildToolDefs() []provider.ToolDef {
@@ -170,22 +322,9 @@ func (e *Engine) buildToolDefs() []provider.ToolDef {
 	return defs
 }
 
-func (e *Engine) buildSystemPrompt() string {
-	parts := []string{coreSystemPrompt}
-
-	if e.ctx.GitStatus != "" {
-		parts = append(parts, "<git_context>\n"+e.ctx.GitStatus+"\n</git_context>")
-	}
-	if e.ctx.ClaudeMD != "" {
-		parts = append(parts, "<user_instructions>\n"+e.ctx.ClaudeMD+"\n</user_instructions>")
-	}
-
-	env := fmt.Sprintf("Working directory: %s\nOS: %s | Shell: %s\nDate: %s",
-		e.ctx.WorkDir, e.ctx.OS, e.ctx.Shell, e.ctx.Date)
-	parts = append(parts, env)
-
-	return strings.Join(parts, "\n\n")
-}
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 type toolCall struct {
 	ID    string
@@ -203,16 +342,9 @@ func extractToolCalls(blocks []provider.ContentBlock) []toolCall {
 	return calls
 }
 
-const coreSystemPrompt = `You are an AI coding assistant powered by Claude. You help users with software engineering tasks directly in their terminal.
-
-You have tools for reading, writing, and editing files, running shell commands, and searching codebases. Use them to accomplish tasks efficiently.
-
-Key guidelines:
-- Read files before editing to understand existing code
-- Use Bash for git operations, running tests, installing packages, etc.
-- Use Edit for surgical file modifications (preferred over Write for existing files)
-- Use Write only for new files or complete rewrites
-- Use Grep/Glob to find relevant files before making changes
-- Be concise; focus on actions over explanations
-- Verify changes work (run tests, check for errors)
-- Follow the project's existing code style and conventions`
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}

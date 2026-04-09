@@ -1,3 +1,7 @@
+// Package context gathers system, project, and user context at startup.
+//
+// This includes OS info, git status, memory files, rules, skills, agents,
+// and MCP server configuration — everything needed to build the system prompt.
 package context
 
 import (
@@ -8,49 +12,71 @@ import (
 	"strings"
 	"time"
 
-	"github.com/noknov/mini-claude-code/internal/config"
+	"github.com/noknov/mini-claude-code/internal/agent"
+	"github.com/noknov/mini-claude-code/internal/mcp"
+	"github.com/noknov/mini-claude-code/internal/memory"
+	"github.com/noknov/mini-claude-code/internal/rules"
+	"github.com/noknov/mini-claude-code/internal/settings"
+	"github.com/noknov/mini-claude-code/internal/skills"
 )
 
-// Info holds system and project context gathered at startup.
+const maxStatusLen = 2000
+
+// Info holds all gathered context.
 type Info struct {
-	OS        string
-	Shell     string
-	WorkDir   string
+	// System
+	OS      string
+	Shell   string
+	WorkDir string
+	Date    string
+
+	// Git
 	GitStatus string
-	ClaudeMD  string
-	Date      string
+
+	// Instruction layers
+	MemoryFiles []memory.File
+	Rules       []rules.Rule
+	Skills      []skills.Skill
+	Agents      []agent.Definition
+
+	// MCP
+	MCPClient *mcp.Client
+
+	// Settings
+	Settings *settings.Settings
 }
 
-// Gather collects system and project context for the system prompt.
+// Gather collects all context for the given working directory.
 func Gather(workDir string) *Info {
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "bash"
-	}
+	s := settings.Load(workDir)
 
 	return &Info{
-		OS:        fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
-		Shell:     shell,
-		WorkDir:   workDir,
-		Date:      time.Now().Format("Monday Jan 2, 2006"),
-		GitStatus: gatherGitStatus(workDir),
-		ClaudeMD:  config.FindClaudeMD(workDir),
+		OS:          fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
+		Shell:       detectShell(),
+		WorkDir:     workDir,
+		Date:        time.Now().Format("Monday Jan 2, 2006"),
+		GitStatus:   gatherGitStatus(workDir),
+		MemoryFiles: memory.LoadAll(workDir),
+		Rules:       rules.LoadAll(workDir),
+		Skills:      skills.LoadAll(workDir),
+		Agents:      agent.LoadAll(workDir),
+		MCPClient:   mcp.NewClient(workDir),
+		Settings:    s,
 	}
 }
 
-const maxStatusLen = 2000
+// ---------------------------------------------------------------------------
+// Git
+// ---------------------------------------------------------------------------
 
 func gatherGitStatus(workDir string) string {
 	if !isGitRepo(workDir) {
 		return ""
 	}
-
 	var parts []string
-
 	if branch := git(workDir, "rev-parse", "--abbrev-ref", "HEAD"); branch != "" {
 		parts = append(parts, "Branch: "+branch)
 	}
-
 	if status := git(workDir, "status", "--short"); status != "" {
 		if len(status) > maxStatusLen {
 			status = status[:maxStatusLen] + "\n... (truncated)"
@@ -59,11 +85,9 @@ func gatherGitStatus(workDir string) string {
 	} else {
 		parts = append(parts, "Status: clean")
 	}
-
 	if log := git(workDir, "log", "--oneline", "-5"); log != "" {
 		parts = append(parts, "Recent commits:\n"+log)
 	}
-
 	return strings.Join(parts, "\n\n")
 }
 
@@ -82,4 +106,15 @@ func git(dir string, args ...string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// ---------------------------------------------------------------------------
+// Shell detection
+// ---------------------------------------------------------------------------
+
+func detectShell() string {
+	if shell := os.Getenv("SHELL"); shell != "" {
+		return shell
+	}
+	return "bash"
 }

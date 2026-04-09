@@ -1,24 +1,39 @@
+// Package session manages conversation state: message history, token
+// accounting, and session identity.
 package session
 
-import "github.com/noknov/mini-claude-code/internal/provider"
+import (
+	"time"
 
-// Session holds the conversation state: message history and token accounting.
+	"github.com/noknov/mini-claude-code/internal/cost"
+	"github.com/noknov/mini-claude-code/internal/provider"
+)
+
+// Session holds the conversation state.
 type Session struct {
-	Messages     []provider.Message
-	InputTokens  int
-	OutputTokens int
+	ID        string
+	Title     string
+	CreatedAt time.Time
+	Messages  []provider.Message
+	Cost      *cost.Tracker
 }
 
-func New() *Session {
-	return &Session{}
+func New(id string) *Session {
+	return &Session{
+		ID:        id,
+		CreatedAt: time.Now(),
+		Cost:      cost.NewTracker(),
+	}
 }
+
+// ---------------------------------------------------------------------------
+// Message management
+// ---------------------------------------------------------------------------
 
 func (s *Session) AddUserMessage(text string) {
 	s.Messages = append(s.Messages, provider.Message{
-		Role: "user",
-		Content: []provider.ContentBlock{
-			{Type: "text", Text: text},
-		},
+		Role:    "user",
+		Content: []provider.ContentBlock{{Type: "text", Text: text}},
 	})
 }
 
@@ -32,34 +47,41 @@ func (s *Session) AddAssistantMessage(blocks []provider.ContentBlock) {
 func (s *Session) AddToolResult(toolUseID, content string, isError bool) {
 	s.Messages = append(s.Messages, provider.Message{
 		Role: "user",
-		Content: []provider.ContentBlock{
-			{
-				Type:      "tool_result",
-				ToolUseID: toolUseID,
-				Content:   content,
-				IsError:   isError,
-			},
-		},
+		Content: []provider.ContentBlock{{
+			Type:      "tool_result",
+			ToolUseID: toolUseID,
+			Content:   content,
+			IsError:   isError,
+		}},
 	})
 }
 
-func (s *Session) UpdateUsage(input, output int) {
-	s.InputTokens += input
-	s.OutputTokens += output
+// SetMessages replaces the message history (used after compaction).
+func (s *Session) SetMessages(msgs []provider.Message) {
+	s.Messages = msgs
 }
+
+// ---------------------------------------------------------------------------
+// Usage tracking
+// ---------------------------------------------------------------------------
+
+func (s *Session) UpdateUsage(model string, inputTokens, outputTokens int) {
+	s.Cost.Add(model, inputTokens, outputTokens)
+}
+
+func (s *Session) TotalTokens() (input, output int) {
+	return s.Cost.TotalTokens()
+}
+
+func (s *Session) EstimateCost() float64 {
+	return s.Cost.EstimateCost()
+}
+
+// ---------------------------------------------------------------------------
+// Reset
+// ---------------------------------------------------------------------------
 
 func (s *Session) Clear() {
 	s.Messages = nil
-	s.InputTokens = 0
-	s.OutputTokens = 0
-}
-
-// EstimateCost returns an approximate cost in USD based on Claude Sonnet pricing.
-func (s *Session) EstimateCost() float64 {
-	const (
-		inputPricePerMTok  = 3.0
-		outputPricePerMTok = 15.0
-	)
-	return float64(s.InputTokens)/1e6*inputPricePerMTok +
-		float64(s.OutputTokens)/1e6*outputPricePerMTok
+	s.Cost.Clear()
 }

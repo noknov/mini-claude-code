@@ -1,85 +1,93 @@
 # mini-claude-code
 
-A minimal reimplementation of [Claude Code](https://docs.anthropic.com/en/docs/claude-code) in Go. ~1850 lines, single binary, zero dependencies.
+A minimal reimplementation of [Claude Code](https://docs.anthropic.com/en/docs/claude-code) in Go. ~5400 lines, single binary, zero dependencies.
 
-## How It Works
-
-When you type a message, the following happens:
+## Architecture
 
 ```
 User input
   │
   ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  main.go                                                        │
-│  Loads config, gathers context, wires everything together,      │
-│  starts the REPL loop.                                          │
-└──────────────────────────┬──────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│  main.go — Entry point                                              │
+│  Parses flags, loads config, gathers context, creates provider,     │
+│  starts REPL (interactive) or runs single prompt (pipe mode -p).    │
+└──────────────────────────┬──────────────────────────────────────────┘
                            │
-  ▼                        ▼
-┌──────────────┐    ┌──────────────────────────────────────────────┐
-│  ui/terminal │    │  query/engine — the core loop                │
-│              │    │                                              │
-│  • Reads     │◄──►│  1. Add user message to session              │
-│    user      │    │  2. Build system prompt (core + git + CLAUDE  │
-│    input     │    │     .md + env info)                          │
-│  • Streams   │    │  3. Send messages + tool defs to API         │
-│    LLM text  │    │  4. Parse SSE stream, accumulate response    │
-│  • Shows     │    │  5. Extract tool_use blocks                  │
-│    tool use  │    │  6. For each tool call:                      │
-│  • Asks      │    │     a. Check permission (ask/auto/deny)      │
-│    permission│    │     b. Execute tool                          │
-│  • Handles   │    │     c. Record tool_result in session         │
-│    /commands │    │  7. If any tool was called → go to step 2    │
-│              │    │     If no tools → done, wait for next input  │
-└──────────────┘    └──────────────────────────────────────────────┘
-                           │
-              ┌────────────┼────────────────┐
-              ▼            ▼                ▼
-        ┌──────────┐ ┌──────────┐   ┌─────────────┐
-        │ api/     │ │ session/ │   │ permission/ │
-        │ client   │ │          │   │             │
-        │          │ │ Messages │   │ ask/auto/   │
-        │ HTTP POST│ │ Token    │   │ deny + per- │
-        │ SSE parse│ │ counts   │   │ tool always │
-        └──────────┘ └──────────┘   └─────────────┘
-              │
-              ▼
-        ┌──────────────────────────────────────┐
-        │  tool/ + tools/                       │
-        │                                       │
-        │  Registry holds 6 tools:              │
-        │  • Bash  — shell execution + timeout  │
-        │  • Read  — file/dir reading           │
-        │  • Write — file creation              │
-        │  • Edit  — string replacement         │
-        │  • Glob  — file pattern search        │
-        │  • Grep  — content search (rg/grep)   │
-        └──────────────────────────────────────┘
+  ┌────────────────────────┼────────────────────────────────┐
+  ▼                        ▼                                ▼
+┌──────────────┐    ┌──────────────────────────────┐  ┌──────────────┐
+│  ui/terminal │    │  query/engine — core loop     │  │  context/    │
+│              │    │                                │  │              │
+│  • REPL      │◄──►│  1. Build system prompt        │  │  Gathers:    │
+│  • Streaming │    │  2. Auto-compact if needed     │  │  • OS/Shell  │
+│  • /commands │    │  3. Send to provider (retry)   │  │  • Git status│
+│  • Permission│    │  4. Parse streaming response   │  │  • Memory    │
+│    prompts   │    │  5. Execute tools (with hooks) │  │  • Rules     │
+│  • Skill     │    │  6. Loop until no more tools   │  │  • Skills    │
+│    invocation│    │                                │  │  • Agents    │
+└──────────────┘    └──────────────────────────────┘  │  • MCP       │
+                           │                           │  • Settings  │
+         ┌─────────────────┼─────────────────┐         └──────────────┘
+         ▼                 ▼                 ▼
+  ┌────────────┐  ┌──────────────┐  ┌──────────────┐
+  │ provider/  │  │ session/     │  │ permission/  │
+  │            │  │              │  │              │
+  │ Anthropic  │  │ Messages     │  │ ask/auto/    │
+  │ OpenAI     │  │ Cost tracker │  │ deny/plan    │
+  │ (any       │  │ Session ID   │  │ Rules file   │
+  │  compat.)  │  │              │  │ Hook-based   │
+  └────────────┘  └──────────────┘  │ Classifier   │
+                                    └──────────────┘
 ```
 
-### Module Breakdown
+## Module Map
 
 | Module | Lines | What it does |
 |--------|------:|--------------|
-| `cmd/mini-claude-code/main.go` | 79 | Entry point. Parses `--version`/`--help`/`--model`, loads config, creates all components, starts REPL. Sets up SIGINT/SIGTERM handler for graceful exit. |
-| `internal/api/client.go` | 224 | Anthropic Messages API client. Builds HTTP request with auth headers, sends it, and parses the SSE stream (`event:` / `data:` lines) into typed `StreamEvent`s delivered via a Go channel. Accepts `context.Context` for cancellation. |
-| `internal/query/engine.go` | 285 | **The heart of the program.** Runs the tool-use loop: calls the API, parses the streamed response into `ContentBlock`s, extracts `tool_use` blocks, executes tools, records `tool_result`s, and loops until the model stops calling tools. Also builds the system prompt and tool definitions. |
-| `internal/tool/tool.go` | 61 | Defines the `Tool` interface (Name, Description, InputSchema, Execute, NeedsPermission, FormatPermissionRequest) and a `Registry` that stores tools in registration order. |
-| `internal/tools/*.go` | 618 | Six built-in tools. Each implements the `Tool` interface. `registry.go` wires them all into a default registry. `resolvePath()` is shared across file tools. |
-| `internal/ui/terminal.go` | 215 | Terminal I/O: prints welcome banner, reads input, streams LLM text character-by-character, displays tool use/results/errors, handles slash commands (`/help`, `/clear`, `/cost`, `/model`, `/compact`, `/exit`), and prompts for permission. Defines the `REPLEngine` interface to decouple from the query engine. |
-| `internal/config/config.go` | 73 | Loads settings from env vars and CLI flags (priority: flags > env > defaults). Also provides `FindClaudeMD()` which walks up the directory tree and checks `~/.claude/CLAUDE.md`. |
-| `internal/context/context.go` | 85 | Gathers system context at startup: OS, shell, git branch/status/recent commits, CLAUDE.md content, current date. All injected into the system prompt. |
-| `internal/session/session.go` | 65 | Manages the `[]api.Message` conversation history, accumulates token counts, and estimates cost based on Claude Sonnet pricing. |
-| `internal/permission/permission.go` | 49 | Three modes: `ask` (prompt user with Y/n/always), `auto` (allow all), `deny` (block all). Remembers per-tool "always" approvals for the session. |
-
-### Key Design Decisions
-
-- **`ContentBlock.Content` is `string`, not `interface{}`** — the Anthropic API expects `tool_result.content` as a string. Using `interface{}` caused serialization ambiguity.
-- **Tool registry preserves insertion order** — so the tools array sent to the API is deterministic (matters for prompt caching).
-- **SSE parsing is hand-rolled** — no SDK dependency. A `bufio.Scanner` reads `event:` / `data:` lines and sends typed events through a channel.
-- **Tool results always feed back to the model** — even when all tools are denied/unknown, the loop continues so the model sees the rejection and can adjust.
-- **`context.Context` plumbed through API calls** — ready for future Ctrl+C cancellation support.
+| **Provider Layer** | | |
+| `provider/provider.go` | 81 | Generic `Provider` interface + unified message/event types |
+| `provider/anthropic.go` | 234 | Anthropic Messages API with SSE streaming |
+| `provider/openai.go` | 313 | OpenAI Chat Completions API (compatible with any OpenAI-like endpoint) |
+| **Core Loop** | | |
+| `query/engine.go` | 350 | Tool-use loop: API call → parse stream → execute tools → repeat. Integrates hooks, compaction, retry, permissions |
+| `prompt/prompt.go` | 163 | System prompt builder with static/dynamic sections, cache boundary |
+| `retry/retry.go` | 136 | Exponential backoff retry + model fallback |
+| **Instruction System** | | |
+| `memory/memory.go` | 170 | 5-layer memory: managed → user → project → local → auto-memory |
+| `rules/rules.go` | 187 | `.claude/rules/*.md` loader with YAML frontmatter conditional globs |
+| `skills/skills.go` | 140 | `.claude/commands/` skill loader, `/skill-name` invocation |
+| **Extensibility** | | |
+| `hooks/hooks.go` | 154 | Lifecycle hooks (PreToolUse, PostToolUse, Pre/PostCompact, Session*) |
+| `agent/agent.go` | 177 | Custom agent definitions from `.claude/agents/*.md` |
+| `mcp/mcp.go` | 309 | MCP client: JSON-RPC over stdio, tool/resource discovery |
+| **Tools** | | |
+| `tools/bash.go` | 108 | Shell execution with timeout |
+| `tools/file_read.go` | 134 | File/directory reading with line numbers |
+| `tools/file_write.go` | 65 | File creation with auto-mkdir |
+| `tools/file_edit.go` | 101 | Exact string replacement |
+| `tools/glob.go` | 181 | File pattern search with `**/` support |
+| `tools/grep.go` | 112 | Content search (ripgrep/grep fallback) |
+| `tools/web_fetch.go` | 76 | HTTP URL fetching |
+| `tools/web_search.go` | 135 | Web search via DuckDuckGo |
+| `tools/agent_tool.go` | 68 | Subagent spawning |
+| `tools/skill_tool.go` | 57 | Programmatic skill invocation |
+| `tools/mcp_tool.go` | 117 | MCP tool/resource access |
+| `tools/notebook_edit.go` | 141 | Jupyter notebook cell editing |
+| `tools/todo_write.go` | 115 | Structured task list management |
+| **Runtime** | | |
+| `compact/compact.go` | 192 | Conversation compaction: auto-detect, full summarize, micro-trim |
+| `permission/permission.go` | 155 | Permission modes + settings rules + hook integration + classifier stub |
+| `session/session.go` | 87 | Message history + cost tracking |
+| `cost/cost.go` | 93 | Multi-model pricing lookup and cost estimation |
+| `sandbox/sandbox.go` | 67 | Bash sandbox stub (macOS/Linux) |
+| `history/history.go` | 137 | Session persistence + resume listing |
+| **Configuration** | | |
+| `config/config.go` | 119 | CLI flags + env vars + pipe mode |
+| `settings/settings.go` | 136 | Multi-layer settings merge (managed/user/project/local) |
+| `context/context.go` | 120 | System/project context gathering |
+| **UI** | | |
+| `ui/terminal.go` | 278 | REPL, streaming, slash commands, skill invocation, permission prompts |
 
 ## Quick Start
 
@@ -89,47 +97,155 @@ go build -o mini-claude-code ./cmd/mini-claude-code
 ./mini-claude-code
 ```
 
-## Environment Variables
+### OpenAI / Compatible Endpoints
+
+```bash
+export MINI_CLAUDE_PROVIDER=openai
+export OPENAI_API_KEY="your-key"
+export OPENAI_BASE_URL="https://api.openai.com"  # or any compatible endpoint
+./mini-claude-code
+```
+
+### Non-Interactive Mode
+
+```bash
+./mini-claude-code -p "explain this error"
+```
+
+## Configuration
+
+### Environment Variables
 
 | Variable | Description |
 |----------|-------------|
-| `ANTHROPIC_API_KEY` | API key (required) |
-| `ANTHROPIC_BASE_URL` | Custom API endpoint |
-| `ANTHROPIC_MODEL` | Default model override |
+| `MINI_CLAUDE_PROVIDER` | Provider: `anthropic` (default), `openai` |
+| `ANTHROPIC_API_KEY` | Anthropic API key |
+| `ANTHROPIC_BASE_URL` | Custom Anthropic endpoint |
+| `OPENAI_API_KEY` | OpenAI API key |
+| `OPENAI_BASE_URL` | Custom OpenAI-compatible endpoint |
 
-## Roadmap
+### Settings Files
 
-Features present in the official Claude Code that we haven't implemented yet, roughly ordered by impact:
+Settings are loaded and merged from (lowest to highest priority):
+1. `/etc/claude-code/settings.json` (managed)
+2. `~/.claude/settings.json` (user)
+3. `.claude/settings.json` (project, in each ancestor dir)
+4. `.claude/settings.local.json` (local, not committed)
 
-### High Priority
+### Memory / Instructions
 
-- [ ] **Conversation compaction** (`/compact`) — When the conversation approaches the context window limit, summarize older messages to free space. The official version has a 5-level compaction hierarchy (snip → microcompact → context collapse → auto-compact → reactive compact). We need at least a basic single-pass summarization.
-- [ ] **Request cancellation (Ctrl+C interrupt)** — `context.Context` is already plumbed through the API layer; wire it to a signal handler so Escape/Ctrl+C aborts the in-flight API call and any running tool. Must generate `tool_result` with `is_error: true` for every orphaned `tool_use` block.
-- [ ] **Concurrent tool execution** — The official version partitions tool calls into read-only batches (run concurrently) and write batches (run serially). We currently run everything serially.
-- [ ] **Streaming tool execution** — Start executing tools as soon as each `tool_use` block is fully received, without waiting for the entire API response to finish.
-- [ ] **Richer system prompt** — The official prompt is thousands of tokens covering git safety protocols, commit/PR formatting, code style rules, and per-tool behavioral instructions. Our prompt is minimal.
+Instruction files are loaded in priority order:
+1. `/etc/claude-code/CLAUDE.md` (managed)
+2. `~/.claude/CLAUDE.md` (user)
+3. `CLAUDE.md` + `.claude/CLAUDE.md` (project, in ancestor dirs)
+4. `CLAUDE.local.md` (local, not committed)
+5. `~/.claude/projects/<slug>/MEMORY.md` (auto-memory)
 
-### Medium Priority
+### Rules
 
-- [ ] **Auto-memory system** — Persistent file-based memory (`~/.claude/projects/<slug>/memory/MEMORY.md`) that the model reads and writes across sessions. Four memory types: user preferences, feedback, project context, reference.
-- [ ] **Prompt caching** — Split the system prompt at a static/dynamic boundary marker. Static content (identity, rules, tool descriptions) gets `cache_control: { scope: "global" }` for cross-session reuse. Dynamic content (git status, CLAUDE.md, date) is uncached.
-- [ ] **API retry and model fallback** — Retry on transient errors (429, 5xx) with exponential backoff. Fall back to a secondary model when the primary is unavailable.
-- [ ] **Multi-turn max-output recovery** — When the model hits `max_tokens` mid-response, automatically continue generation (up to 3 retries) instead of truncating.
-- [ ] **`.claude/rules/*.md` support** — Load all `.md` files from `.claude/rules/` directories (not just `CLAUDE.md`), with `@include` directive support.
-- [ ] **Non-interactive / pipe mode** — Accept a prompt via CLI argument or stdin, print the response, and exit. Useful for scripting (`mini-claude-code -p "explain this error"`).
+Place `.md` files in `.claude/rules/` for project-specific instructions.
+Add YAML frontmatter with `paths:` to make rules conditional:
 
-### Lower Priority
+```markdown
+---
+paths:
+  - "*.go"
+  - "internal/**/*.go"
+---
+Always use Go error wrapping with %w.
+```
 
-- [ ] **Agent / subagent system** — Spawn child conversations with isolated context for research, code review, or parallel tasks. The official version supports both "fork" (inherits parent context) and "fresh" (clean slate) agents.
-- [ ] **Hooks system** — User-configurable shell commands that run before/after tool execution (pre-tool-use, post-tool-use, post-sampling hooks).
-- [ ] **MCP (Model Context Protocol) integration** — Connect to external MCP servers to extend tool capabilities.
-- [ ] **Permission rules engine** — Glob-based allow/deny rules in settings (e.g., `Bash(git *)` to auto-approve git commands) instead of per-invocation prompts.
-- [ ] **Bash sandbox** — Restrict file system and network access for shell commands using OS-level sandboxing.
-- [ ] **Session persistence** — Save/restore conversation history to disk so sessions survive restarts. Support `/resume` to continue a previous session.
-- [ ] **Token budget tracking** — Let users specify a token budget (e.g., `+500k`) and auto-continue until the budget is spent.
-- [ ] **Cost tracking per model** — Dynamic pricing lookup instead of hardcoded Sonnet rates. Track costs across model switches.
-- [ ] **Multi-line input** — Support pasting or typing multi-line prompts (the official version uses a full React+Ink terminal UI).
-- [ ] **Markdown rendering** — Render code blocks with syntax highlighting and format tables/lists in the terminal output.
+### Skills
+
+Place `.md` files in `.claude/commands/` to create reusable prompt templates.
+Invoke with `/skill-name` in the REPL.
+
+### Agents
+
+Place `.md` files in `.claude/agents/` with optional frontmatter:
+
+```markdown
+---
+description: Code reviewer
+model: claude-sonnet-4-20250514
+permission_mode: auto
+tools:
+  - Read
+  - Grep
+  - Glob
+---
+You are a code reviewer. Analyze the code for bugs and improvements.
+```
+
+### Hooks
+
+Configure in `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      { "command": "echo $TOOL_NAME $TOOL_INPUT", "if": "Bash" }
+    ],
+    "PostToolUse": [
+      { "command": "notify-send 'Tool done'" }
+    ]
+  }
+}
+```
+
+### MCP Servers
+
+Configure in `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "my-server": {
+      "command": "node",
+      "args": ["server.js"],
+      "env": { "PORT": "3000" }
+    }
+  }
+}
+```
+
+## Feature Coverage vs Claude Code
+
+| Feature | Claude Code | mini-claude-code |
+|---------|:-----------:|:----------------:|
+| LLM tool-use loop | ✅ | ✅ |
+| Multi-provider (Anthropic/OpenAI) | ✅ | ✅ |
+| SSE streaming | ✅ | ✅ |
+| Core tools (Bash/Read/Write/Edit/Glob/Grep) | ✅ | ✅ |
+| WebFetch / WebSearch | ✅ | ✅ |
+| Notebook editing | ✅ | ✅ |
+| Todo/task management | ✅ | ✅ |
+| Multi-layer memory (5 levels) | ✅ | ✅ |
+| Rules system (conditional globs) | ✅ | ✅ |
+| Skills system | ✅ | ✅ |
+| Hooks (pre/post tool, compact, session) | ✅ | ✅ |
+| Conversation compaction (auto/full/micro) | ✅ | ✅ |
+| Agent/Subagent definitions | ✅ | ✅ (basic) |
+| MCP integration | ✅ | ✅ (stdio) |
+| Permission rules (allow/deny globs) | ✅ | ✅ |
+| Multi-layer settings merge | ✅ | ✅ |
+| API retry + model fallback | ✅ | ✅ |
+| Non-interactive pipe mode | ✅ | ✅ |
+| Session persistence / resume | ✅ | ✅ (basic) |
+| Multi-model cost tracking | ✅ | ✅ |
+| System prompt caching boundary | ✅ | ✅ (designed) |
+| Sandbox stub | ✅ | ✅ (stub) |
+| Ctrl+C interruption | ✅ | ✅ |
+| Bash classifier (auto-approve safe cmds) | ✅ | stub |
+| Fork subagent (cache sharing) | ✅ | planned |
+| React+Ink terminal UI | ✅ | ANSI (simpler) |
+| LSP integration | ✅ | — |
+| Voice input | ✅ | — |
+| Plugin system | ✅ | — |
+| OAuth / auth | ✅ | — |
+| Remote sessions | ✅ | — |
+| Vim keybindings | ✅ | — |
 
 ## License
 

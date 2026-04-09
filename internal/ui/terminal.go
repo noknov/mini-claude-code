@@ -1,3 +1,5 @@
+// Package ui handles all terminal I/O: the REPL loop, streaming output,
+// tool display, permission prompts, and slash commands.
 package ui
 
 import (
@@ -7,9 +9,10 @@ import (
 	"strings"
 
 	"github.com/noknov/mini-claude-code/internal/config"
+	"github.com/noknov/mini-claude-code/internal/skills"
 )
 
-// ANSI escape sequences for terminal styling.
+// ANSI escape sequences.
 const (
 	reset  = "\033[0m"
 	red    = "\033[31m"
@@ -20,22 +23,28 @@ const (
 	bold   = "\033[1m"
 )
 
+// ---------------------------------------------------------------------------
+// Terminal
+// ---------------------------------------------------------------------------
+
 // Terminal handles all user-facing I/O.
 type Terminal struct {
 	cfg       *config.Config
 	reader    *bufio.Reader
 	streaming bool
+	skills    []skills.Skill
 }
 
-func NewTerminal(cfg *config.Config) *Terminal {
+func NewTerminal(cfg *config.Config, sk []skills.Skill) *Terminal {
 	return &Terminal{
 		cfg:    cfg,
 		reader: bufio.NewReader(os.Stdin),
+		skills: sk,
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Display helpers
+// Display
 // ---------------------------------------------------------------------------
 
 func (t *Terminal) PrintWelcome(version, providerName, model, workDir string) {
@@ -55,15 +64,8 @@ func (t *Terminal) ReadInput() (string, error) {
 	return strings.TrimSpace(line), nil
 }
 
-func (t *Terminal) StartStreaming() {
-	t.streaming = true
-	fmt.Print("\n")
-}
-
-func (t *Terminal) StreamText(text string) {
-	fmt.Print(text)
-}
-
+func (t *Terminal) StartStreaming()        { t.streaming = true; fmt.Print("\n") }
+func (t *Terminal) StreamText(text string) { fmt.Print(text) }
 func (t *Terminal) StopStreaming() {
 	if t.streaming {
 		fmt.Println()
@@ -72,8 +74,7 @@ func (t *Terminal) StopStreaming() {
 }
 
 func (t *Terminal) PrintToolUse(name string, input interface{}) {
-	summary := formatToolInput(input)
-	fmt.Printf("\n%s> %s%s %s%s%s\n", yellow, name, reset, dim, summary, reset)
+	fmt.Printf("\n%s> %s%s %s%s%s\n", yellow, name, reset, dim, formatToolInput(input), reset)
 }
 
 func (t *Terminal) PrintToolResult(name, result string) {
@@ -129,6 +130,7 @@ type REPLEngine interface {
 	ClearSession()
 	SetModel(model string)
 	GetModel() string
+	Cancel()
 }
 
 func (t *Terminal) RunREPL(engine REPLEngine) {
@@ -149,55 +151,115 @@ func (t *Terminal) RunREPL(engine REPLEngine) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Slash commands
+// ---------------------------------------------------------------------------
+
 func (t *Terminal) handleCommand(input string, engine REPLEngine) bool {
 	parts := strings.Fields(input)
-	switch parts[0] {
+	cmd := parts[0]
+
+	switch cmd {
 	case "/help":
 		t.printHelp()
 	case "/clear":
 		engine.ClearSession()
 		t.PrintSuccess("Conversation cleared")
 	case "/cost":
-		in, out, cost := engine.SessionInfo()
-		fmt.Printf("\n%sToken Usage:%s\n", bold, reset)
-		fmt.Printf("  Input:  %d tokens\n", in)
-		fmt.Printf("  Output: %d tokens\n", out)
-		fmt.Printf("  Cost:   ~$%.4f\n\n", cost)
+		t.printCost(engine)
 	case "/model":
-		if len(parts) > 1 {
-			engine.SetModel(parts[1])
-			t.PrintSuccess(fmt.Sprintf("Model set to %s", parts[1]))
-		} else {
-			fmt.Printf("Current model: %s\n", engine.GetModel())
-		}
+		t.handleModelCommand(parts, engine)
 	case "/compact":
-		t.PrintInfo("Compact is not yet implemented")
+		t.PrintInfo("Triggering manual compaction...")
+		// TODO: wire to compactor directly
+	case "/memory":
+		t.PrintInfo("Memory files are loaded at startup from CLAUDE.md and .claude/ directories")
+	case "/skills":
+		t.printSkills()
+	case "/permissions":
+		t.PrintInfo("Permission mode: ask | Use /permissions auto or /permissions deny to change")
+	case "/resume":
+		t.PrintInfo("Session resume: not yet implemented")
 	case "/exit", "/quit":
 		fmt.Println("Goodbye!")
 		os.Exit(0)
 	default:
-		t.PrintError(fmt.Errorf("unknown command: %s (try /help)", parts[0]))
+		// Check if it's a skill invocation
+		if t.trySkillInvocation(cmd, engine) {
+			return true
+		}
+		t.PrintError(fmt.Errorf("unknown command: %s (try /help)", cmd))
 	}
+	return true
+}
+
+func (t *Terminal) printCost(engine REPLEngine) {
+	in, out, cost := engine.SessionInfo()
+	fmt.Printf("\n%sToken Usage:%s\n", bold, reset)
+	fmt.Printf("  Input:  %d tokens\n", in)
+	fmt.Printf("  Output: %d tokens\n", out)
+	fmt.Printf("  Cost:   ~$%.4f\n\n", cost)
+}
+
+func (t *Terminal) handleModelCommand(parts []string, engine REPLEngine) {
+	if len(parts) > 1 {
+		engine.SetModel(parts[1])
+		t.PrintSuccess(fmt.Sprintf("Model set to %s", parts[1]))
+	} else {
+		fmt.Printf("Current model: %s\n", engine.GetModel())
+	}
+}
+
+func (t *Terminal) printSkills() {
+	if len(t.skills) == 0 {
+		t.PrintInfo("No skills loaded. Add .md files to .claude/commands/ to create skills.")
+		return
+	}
+	fmt.Printf("\n%sAvailable skills:%s\n", bold, reset)
+	for _, s := range t.skills {
+		fmt.Printf("  /%s\n", s.Name)
+	}
+	fmt.Println()
+}
+
+func (t *Terminal) trySkillInvocation(cmd string, engine REPLEngine) bool {
+	name := strings.TrimPrefix(cmd, "/")
+	skill := skills.Find(t.skills, name)
+	if skill == nil {
+		return false
+	}
+	t.PrintInfo(fmt.Sprintf("Running skill: %s", name))
+	engine.Run(skill.Content, t)
 	return true
 }
 
 func (t *Terminal) printHelp() {
 	fmt.Printf(`
 %sCommands:%s
-  /help       Show this help
-  /clear      Clear conversation history
-  /cost       Show token usage and estimated cost
-  /model      Show or change the current model
-  /compact    Compress conversation context (TODO)
-  /exit       Exit the program
+  /help          Show this help
+  /clear         Clear conversation history
+  /cost          Show token usage and estimated cost
+  /model [name]  Show or change the current model
+  /compact       Compress conversation context
+  /memory        Show memory file info
+  /skills        List available skills
+  /permissions   Show permission mode
+  /resume        Resume a previous session
+  /exit          Exit the program
+
+%sSkills:%s
+  /skill-name    Run a skill from .claude/commands/
 
 %sKeyboard:%s
-  Ctrl+C      Exit
+  Ctrl+C         Interrupt current operation / Exit
 
-`, bold, reset, bold, reset)
+`, bold, reset, bold, reset, bold, reset)
 }
 
-// formatToolInput produces a short one-line summary of the tool input.
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 func formatToolInput(input interface{}) string {
 	var s string
 	switch v := input.(type) {
