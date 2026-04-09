@@ -1,10 +1,10 @@
 package session
 
-import "github.com/noknov/mini-claude-code/internal/api"
+import "github.com/noknov/mini-claude-code/internal/provider"
 
 // Session holds the conversation state: message history and token accounting.
 type Session struct {
-	Messages     []api.Message
+	Messages     []provider.Message
 	InputTokens  int
 	OutputTokens int
 }
@@ -14,25 +14,25 @@ func New() *Session {
 }
 
 func (s *Session) AddUserMessage(text string) {
-	s.Messages = append(s.Messages, api.Message{
+	s.Messages = append(s.Messages, provider.Message{
 		Role: "user",
-		Content: []api.ContentBlock{
+		Content: []provider.ContentBlock{
 			{Type: "text", Text: text},
 		},
 	})
 }
 
-func (s *Session) AddAssistantMessage(blocks []api.ContentBlock) {
-	s.Messages = append(s.Messages, api.Message{
+func (s *Session) AddAssistantMessage(blocks []provider.ContentBlock) {
+	s.Messages = append(s.Messages, provider.Message{
 		Role:    "assistant",
 		Content: blocks,
 	})
 }
 
 func (s *Session) AddToolResult(toolUseID, content string, isError bool) {
-	s.Messages = append(s.Messages, api.Message{
+	s.Messages = append(s.Messages, provider.Message{
 		Role: "user",
-		Content: []api.ContentBlock{
+		Content: []provider.ContentBlock{
 			{
 				Type:      "tool_result",
 				ToolUseID: toolUseID,

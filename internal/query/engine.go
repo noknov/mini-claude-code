@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/noknov/mini-claude-code/internal/api"
 	"github.com/noknov/mini-claude-code/internal/config"
 	ctxinfo "github.com/noknov/mini-claude-code/internal/context"
 	"github.com/noknov/mini-claude-code/internal/permission"
+	"github.com/noknov/mini-claude-code/internal/provider"
 	"github.com/noknov/mini-claude-code/internal/session"
 	"github.com/noknov/mini-claude-code/internal/tool"
 	"github.com/noknov/mini-claude-code/internal/tools"
@@ -18,7 +18,7 @@ import (
 
 // Engine orchestrates the query loop: user input → API → tool execution → repeat.
 type Engine struct {
-	client   *api.Client
+	provider provider.Provider
 	session  *session.Session
 	ctx      *ctxinfo.Info
 	cfg      *config.Config
@@ -26,9 +26,9 @@ type Engine struct {
 	perm     *permission.Manager
 }
 
-func NewEngine(client *api.Client, sess *session.Session, ctx *ctxinfo.Info, cfg *config.Config) *Engine {
+func NewEngine(prov provider.Provider, sess *session.Session, ctx *ctxinfo.Info, cfg *config.Config) *Engine {
 	return &Engine{
-		client:   client,
+		provider: prov,
 		session:  sess,
 		ctx:      ctx,
 		cfg:      cfg,
@@ -37,21 +37,13 @@ func NewEngine(client *api.Client, sess *session.Session, ctx *ctxinfo.Info, cfg
 	}
 }
 
-// ---------------------------------------------------------------------------
-// REPLEngine interface
-// ---------------------------------------------------------------------------
-
 func (e *Engine) SessionInfo() (inputTokens, outputTokens int, cost float64) {
 	return e.session.InputTokens, e.session.OutputTokens, e.session.EstimateCost()
 }
 
 func (e *Engine) ClearSession()     { e.session.Clear() }
-func (e *Engine) SetModel(m string) { e.client.SetModel(m) }
-func (e *Engine) GetModel() string  { return e.client.Model() }
-
-// ---------------------------------------------------------------------------
-// Main query loop
-// ---------------------------------------------------------------------------
+func (e *Engine) SetModel(m string) { e.provider.SetModel(m) }
+func (e *Engine) GetModel() string  { return e.provider.Model() }
 
 // Run processes a user message through the full tool-use loop.
 func (e *Engine) Run(userInput string, terminal *ui.Terminal) {
@@ -71,19 +63,11 @@ func (e *Engine) Run(userInput string, terminal *ui.Terminal) {
 			return
 		}
 
-		hasExecuted := e.executeTools(toolCalls, terminal)
-		if !hasExecuted {
-			// Every tool was unknown or denied — still feed results back to
-			// the API so the model can adjust its approach.
-		}
+		e.executeTools(toolCalls, terminal)
 	}
 }
 
-// executeTools runs each tool call, records results, and returns true if at
-// least one tool was actually executed (not just denied/unknown).
-func (e *Engine) executeTools(calls []toolCall, terminal *ui.Terminal) bool {
-	executed := false
-
+func (e *Engine) executeTools(calls []toolCall, terminal *ui.Terminal) {
 	for _, tc := range calls {
 		terminal.PrintToolUse(tc.Name, tc.Input)
 
@@ -111,38 +95,59 @@ func (e *Engine) executeTools(calls []toolCall, terminal *ui.Terminal) bool {
 			e.session.AddToolResult(tc.ID, result, false)
 			terminal.PrintToolResult(tc.Name, result)
 		}
-		executed = true
 	}
-	return executed
 }
 
-// ---------------------------------------------------------------------------
-// API call + SSE parsing
-// ---------------------------------------------------------------------------
-
-func (e *Engine) callAPI(ctx context.Context, terminal *ui.Terminal) *api.StreamResponse {
-	req := api.CreateMessageRequest{
-		System:   e.buildSystemPrompt(),
-		Messages: e.session.Messages,
-		Tools:    e.buildToolDefs(),
+func (e *Engine) callAPI(ctx context.Context, terminal *ui.Terminal) *provider.Response {
+	req := provider.Request{
+		SystemPrompt: e.buildSystemPrompt(),
+		Messages:     e.session.Messages,
+		Tools:        e.buildToolDefs(),
 	}
 
-	eventCh, errCh := e.client.CreateMessageStream(ctx, req)
+	eventCh, errCh := e.provider.SendStream(ctx, req)
 
-	resp := &api.StreamResponse{}
-	var currentBlock *api.ContentBlock
-	var jsonBuf strings.Builder
+	var resp provider.Response
+	streaming := false
 
 	for {
 		select {
 		case evt, ok := <-eventCh:
 			if !ok {
-				return resp
+				if streaming {
+					terminal.StopStreaming()
+				}
+				return &resp
 			}
-			e.handleSSE(evt, resp, &currentBlock, &jsonBuf, terminal)
+			switch evt.Type {
+			case "text":
+				if evt.Text != "" {
+					if !streaming {
+						terminal.StartStreaming()
+						streaming = true
+					}
+					terminal.StreamText(evt.Text)
+				}
+			case "tool_use_start":
+				if streaming {
+					terminal.StopStreaming()
+					streaming = false
+				}
+			case "done":
+				if streaming {
+					terminal.StopStreaming()
+					streaming = false
+				}
+				if evt.Response != nil {
+					resp = *evt.Response
+				}
+			}
 
 		case err, ok := <-errCh:
 			if ok && err != nil {
+				if streaming {
+					terminal.StopStreaming()
+				}
 				terminal.PrintError(fmt.Errorf("API error: %w", err))
 				return nil
 			}
@@ -150,85 +155,13 @@ func (e *Engine) callAPI(ctx context.Context, terminal *ui.Terminal) *api.Stream
 	}
 }
 
-func (e *Engine) handleSSE(
-	evt api.StreamEvent,
-	resp *api.StreamResponse,
-	currentBlock **api.ContentBlock,
-	jsonBuf *strings.Builder,
-	terminal *ui.Terminal,
-) {
-	switch evt.Type {
-	case "message_start":
-		var d api.MessageStartData
-		if json.Unmarshal(evt.Data, &d) == nil {
-			resp.ID = d.ID
-			resp.Model = d.Model
-			if d.Usage != nil {
-				resp.InputTokens = d.Usage.InputTokens
-			}
-		}
-
-	case "content_block_start":
-		var d api.ContentBlockStartData
-		if json.Unmarshal(evt.Data, &d) == nil {
-			block := d.ContentBlock
-			*currentBlock = &block
-			jsonBuf.Reset()
-			if block.Type == "text" {
-				terminal.StartStreaming()
-			}
-		}
-
-	case "content_block_delta":
-		var d api.ContentBlockDeltaData
-		if json.Unmarshal(evt.Data, &d) != nil {
-			return
-		}
-		switch d.Delta.Type {
-		case "text_delta":
-			if *currentBlock != nil {
-				(*currentBlock).Text += d.Delta.Text
-				terminal.StreamText(d.Delta.Text)
-			}
-		case "input_json_delta":
-			jsonBuf.WriteString(d.Delta.PartialJSON)
-		}
-
-	case "content_block_stop":
-		if *currentBlock == nil {
-			return
-		}
-		if (*currentBlock).Type == "tool_use" && jsonBuf.Len() > 0 {
-			(*currentBlock).Input = json.RawMessage(jsonBuf.String())
-		}
-		if (*currentBlock).Type == "text" {
-			terminal.StopStreaming()
-		}
-		resp.ContentBlocks = append(resp.ContentBlocks, **currentBlock)
-		*currentBlock = nil
-
-	case "message_delta":
-		var d api.MessageDeltaData
-		if json.Unmarshal(evt.Data, &d) == nil {
-			resp.StopReason = d.Delta.StopReason
-			if d.Usage != nil {
-				resp.OutputTokens = d.Usage.OutputTokens
-			}
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-func (e *Engine) buildToolDefs() []api.ToolDef {
+func (e *Engine) buildToolDefs() []provider.ToolDef {
 	allTools := e.registry.All()
-	defs := make([]api.ToolDef, 0, len(allTools))
+	defs := make([]provider.ToolDef, 0, len(allTools))
 	for _, t := range allTools {
 		var schema interface{}
 		_ = json.Unmarshal(t.InputSchema(), &schema)
-		defs = append(defs, api.ToolDef{
+		defs = append(defs, provider.ToolDef{
 			Name:        t.Name(),
 			Description: t.Description(),
 			InputSchema: schema,
@@ -260,7 +193,7 @@ type toolCall struct {
 	Input json.RawMessage
 }
 
-func extractToolCalls(blocks []api.ContentBlock) []toolCall {
+func extractToolCalls(blocks []provider.ContentBlock) []toolCall {
 	var calls []toolCall
 	for _, b := range blocks {
 		if b.Type == "tool_use" {

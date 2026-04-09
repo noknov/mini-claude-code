@@ -38,10 +38,11 @@ func NewTerminal(cfg *config.Config) *Terminal {
 // Display helpers
 // ---------------------------------------------------------------------------
 
-func (t *Terminal) PrintWelcome(version, model, workDir string) {
+func (t *Terminal) PrintWelcome(version, providerName, model, workDir string) {
 	fmt.Printf("\n%s%s mini-claude-code%s v%s\n", bold, cyan, reset, version)
-	fmt.Printf("  Model: %s%s%s\n", bold, model, reset)
-	fmt.Printf("  Dir:   %s\n", workDir)
+	fmt.Printf("  Provider: %s\n", providerName)
+	fmt.Printf("  Model:    %s%s%s\n", bold, model, reset)
+	fmt.Printf("  Dir:      %s\n", workDir)
 	fmt.Printf("  %sTip: /help for commands, Ctrl+C to exit%s\n\n", dim, reset)
 }
 

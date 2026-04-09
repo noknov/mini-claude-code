@@ -6,11 +6,15 @@ import (
 	"strings"
 )
 
-const DefaultModel = "claude-sonnet-4-20250514"
+const (
+	DefaultAnthropicModel = "claude-sonnet-4-20250514"
+	DefaultOpenAIModel    = "gpt-4o"
+)
 
 // Config holds all application settings.
 // Priority (highest wins): CLI flags > environment variables > defaults.
 type Config struct {
+	Provider       string // "anthropic" (default), "openai"
 	APIKey         string
 	Model          string
 	BaseURL        string
@@ -25,22 +29,53 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
-	model := DefaultModel
+	prov := "anthropic"
+	if p := os.Getenv("MINI_CLAUDE_PROVIDER"); p != "" {
+		prov = p
+	}
+
+	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+	baseURL := os.Getenv("ANTHROPIC_BASE_URL")
+	model := DefaultAnthropicModel
 	if m := os.Getenv("ANTHROPIC_MODEL"); m != "" {
 		model = m
 	}
+
+	if prov == "openai" {
+		apiKey = os.Getenv("OPENAI_API_KEY")
+		baseURL = os.Getenv("OPENAI_BASE_URL")
+		model = DefaultOpenAIModel
+		if m := os.Getenv("OPENAI_MODEL"); m != "" {
+			model = m
+		}
+	}
+
+	permMode := "ask"
+
 	for i, arg := range os.Args {
-		if (arg == "-m" || arg == "--model") && i+1 < len(os.Args) {
-			model = os.Args[i+1]
+		switch arg {
+		case "-m", "--model":
+			if i+1 < len(os.Args) {
+				model = os.Args[i+1]
+			}
+		case "--provider":
+			if i+1 < len(os.Args) {
+				prov = os.Args[i+1]
+			}
+		case "--auto":
+			permMode = "auto"
+		case "--deny":
+			permMode = "deny"
 		}
 	}
 
 	return &Config{
-		APIKey:         os.Getenv("ANTHROPIC_API_KEY"),
+		Provider:       prov,
+		APIKey:         apiKey,
 		Model:          model,
-		BaseURL:        os.Getenv("ANTHROPIC_BASE_URL"),
+		BaseURL:        baseURL,
 		WorkDir:        workDir,
-		PermissionMode: "ask",
+		PermissionMode: permMode,
 	}, nil
 }
 
