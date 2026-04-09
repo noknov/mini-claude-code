@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-const maxGrepResults = 5000
+const maxGrepLines = 5000
 
 type GrepTool struct{}
 
@@ -20,8 +20,9 @@ type grepInput struct {
 func (t *GrepTool) Name() string { return "Grep" }
 
 func (t *GrepTool) Description() string {
-	return `Search file contents using ripgrep. Supports regex patterns.
-Falls back to grep if ripgrep is not installed.`
+	return `Search file contents using ripgrep (rg). Supports full regex syntax.
+Falls back to grep -rn if ripgrep is not installed.
+Use the glob parameter to filter by file type (e.g. "*.go").`
 }
 
 func (t *GrepTool) InputSchema() json.RawMessage {
@@ -49,7 +50,7 @@ func (t *GrepTool) NeedsPermission(_ json.RawMessage) bool { return false }
 
 func (t *GrepTool) FormatPermissionRequest(input json.RawMessage) string {
 	var in grepInput
-	json.Unmarshal(input, &in)
+	_ = json.Unmarshal(input, &in)
 	return fmt.Sprintf("Search for: %s", in.Pattern)
 }
 
@@ -64,53 +65,48 @@ func (t *GrepTool) Execute(input json.RawMessage, workDir string) (string, error
 		searchPath = resolvePath(in.Path, workDir)
 	}
 
-	args := []string{"-n", "--color=never", "--no-heading"}
-	if in.Include != "" {
-		args = append(args, "--glob", in.Include)
+	if _, err := exec.LookPath("rg"); err != nil {
+		return runGrep(in.Pattern, searchPath, workDir)
 	}
-	args = append(args, in.Pattern, searchPath)
-
-	rgPath, err := exec.LookPath("rg")
-	if err != nil {
-		return grepFallback(in.Pattern, searchPath, workDir)
-	}
-
-	cmd := exec.Command(rgPath, args...)
-	cmd.Dir = workDir
-	output, err := cmd.CombinedOutput()
-	result := string(output)
-
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-			return "No matches found", nil
-		}
-		if result != "" {
-			return result, nil
-		}
-		return "", fmt.Errorf("grep failed: %w", err)
-	}
-
-	lines := strings.Split(result, "\n")
-	if len(lines) > maxGrepResults {
-		lines = lines[:maxGrepResults]
-		result = strings.Join(lines, "\n") + fmt.Sprintf("\n... (truncated, showing first %d matches)", maxGrepResults)
-	}
-
-	return result, nil
+	return runRipgrep(in.Pattern, in.Include, searchPath, workDir)
 }
 
-func grepFallback(pattern, searchPath, workDir string) (string, error) {
+func runRipgrep(pattern, include, searchPath, workDir string) (string, error) {
+	args := []string{"-n", "--color=never", "--no-heading"}
+	if include != "" {
+		args = append(args, "--glob", include)
+	}
+	args = append(args, pattern, searchPath)
+
+	cmd := exec.Command("rg", args...)
+	cmd.Dir = workDir
+	output, err := cmd.CombinedOutput()
+	return handleSearchResult(string(output), err)
+}
+
+func runGrep(pattern, searchPath, workDir string) (string, error) {
 	cmd := exec.Command("grep", "-rn", "--color=never", pattern, searchPath)
 	cmd.Dir = workDir
 	output, err := cmd.CombinedOutput()
-	result := string(output)
+	return handleSearchResult(string(output), err)
+}
 
+func handleSearchResult(output string, err error) (string, error) {
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
 			return "No matches found", nil
 		}
-		return result, nil
+		if output != "" {
+			return output, nil
+		}
+		return "", fmt.Errorf("search failed: %w", err)
 	}
 
-	return result, nil
+	lines := strings.Split(output, "\n")
+	if len(lines) > maxGrepLines {
+		lines = lines[:maxGrepLines]
+		output = strings.Join(lines, "\n") +
+			fmt.Sprintf("\n... (truncated, showing first %d matches)", maxGrepLines)
+	}
+	return output, nil
 }

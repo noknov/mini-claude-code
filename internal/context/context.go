@@ -11,7 +11,7 @@ import (
 	"github.com/noknov/mini-claude-code/internal/config"
 )
 
-// Info holds gathered system and project context
+// Info holds system and project context gathered at startup.
 type Info struct {
 	OS        string
 	Shell     string
@@ -21,51 +21,47 @@ type Info struct {
 	Date      string
 }
 
-// Gather collects system and project context for the system prompt
+// Gather collects system and project context for the system prompt.
 func Gather(workDir string) *Info {
-	info := &Info{
-		OS:      fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
-		Shell:   os.Getenv("SHELL"),
-		WorkDir: workDir,
-		Date:    time.Now().Format("Monday Jan 2, 2006"),
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "bash"
 	}
 
-	if info.Shell == "" {
-		info.Shell = "bash"
+	return &Info{
+		OS:        fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
+		Shell:     shell,
+		WorkDir:   workDir,
+		Date:      time.Now().Format("Monday Jan 2, 2006"),
+		GitStatus: gatherGitStatus(workDir),
+		ClaudeMD:  config.FindClaudeMD(workDir),
 	}
-
-	info.GitStatus = getGitStatus(workDir)
-	info.ClaudeMD = config.FindClaudeMD(workDir)
-
-	return info
 }
 
-func getGitStatus(workDir string) string {
+const maxStatusLen = 2000
+
+func gatherGitStatus(workDir string) string {
 	if !isGitRepo(workDir) {
 		return ""
 	}
 
 	var parts []string
 
-	if branch := gitCmd(workDir, "rev-parse", "--abbrev-ref", "HEAD"); branch != "" {
-		parts = append(parts, fmt.Sprintf("Branch: %s", branch))
+	if branch := git(workDir, "rev-parse", "--abbrev-ref", "HEAD"); branch != "" {
+		parts = append(parts, "Branch: "+branch)
 	}
 
-	if status := gitCmd(workDir, "status", "--short"); status != "" {
-		if len(status) > 2000 {
-			status = status[:2000] + "\n... (truncated)"
+	if status := git(workDir, "status", "--short"); status != "" {
+		if len(status) > maxStatusLen {
+			status = status[:maxStatusLen] + "\n... (truncated)"
 		}
-		parts = append(parts, fmt.Sprintf("Status:\n%s", status))
+		parts = append(parts, "Status:\n"+status)
 	} else {
 		parts = append(parts, "Status: clean")
 	}
 
-	if log := gitCmd(workDir, "log", "--oneline", "-5"); log != "" {
-		parts = append(parts, fmt.Sprintf("Recent commits:\n%s", log))
-	}
-
-	if len(parts) == 0 {
-		return ""
+	if log := git(workDir, "log", "--oneline", "-5"); log != "" {
+		parts = append(parts, "Recent commits:\n"+log)
 	}
 
 	return strings.Join(parts, "\n\n")
@@ -74,16 +70,16 @@ func getGitStatus(workDir string) string {
 func isGitRepo(dir string) bool {
 	cmd := exec.Command("git", "rev-parse", "--is-inside-work-tree")
 	cmd.Dir = dir
-	output, err := cmd.Output()
-	return err == nil && strings.TrimSpace(string(output)) == "true"
+	out, err := cmd.Output()
+	return err == nil && strings.TrimSpace(string(out)) == "true"
 }
 
-func gitCmd(dir string, args ...string) string {
+func git(dir string, args ...string) string {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
-	output, err := cmd.Output()
+	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(output))
+	return strings.TrimSpace(string(out))
 }

@@ -30,30 +30,28 @@ func main() {
 
 	cfg, err := config.Load()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-
 	if cfg.APIKey == "" {
 		fmt.Fprintln(os.Stderr, "ANTHROPIC_API_KEY is not set.")
-		fmt.Fprintln(os.Stderr, "Set it via environment variable or run with --help for more info.")
+		fmt.Fprintln(os.Stderr, "Set it via environment variable or run with --help.")
 		os.Exit(1)
 	}
 
 	client := api.NewClient(cfg.APIKey, cfg.Model, cfg.BaseURL)
 	sess := session.New()
 	ctx := context.Gather(cfg.WorkDir)
-
 	terminal := ui.NewTerminal(cfg)
-	terminal.PrintWelcome(version, cfg.Model, cfg.WorkDir)
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
 	engine := query.NewEngine(client, sess, ctx, cfg)
 
+	terminal.PrintWelcome(version, cfg.Model, cfg.WorkDir)
+
+	// Graceful shutdown on SIGINT / SIGTERM.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		<-sigCh
+		<-sig
 		fmt.Println("\nGoodbye!")
 		os.Exit(0)
 	}()
@@ -62,26 +60,20 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Println(`mini-claude-code - A minimal Claude Code implementation in Go
+	fmt.Println(`mini-claude-code — A minimal Claude Code implementation in Go
 
 Usage:
-  mini-claude-code [flags] [initial prompt]
+  mini-claude-code [flags]
 
 Flags:
   -h, --help       Show this help message
   -v, --version    Show version
   -m, --model      Set model (default: claude-sonnet-4-20250514)
-  -p, --print      Non-interactive mode: print response and exit
 
 Environment:
-  ANTHROPIC_API_KEY    API key for Anthropic (required)
+  ANTHROPIC_API_KEY    API key (required)
   ANTHROPIC_BASE_URL   Custom API base URL
 
-Slash Commands (in REPL):
-  /help       Show available commands
-  /compact    Compress conversation context
-  /clear      Clear conversation history
-  /cost       Show token usage and cost
-  /model      Switch model
-  /exit       Exit the program`)
+Commands (in REPL):
+  /help    /clear    /cost    /model    /compact    /exit`)
 }

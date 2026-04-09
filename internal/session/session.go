@@ -1,12 +1,10 @@
 package session
 
-import (
-	"github.com/noknov/mini-claude-code/internal/api"
-)
+import "github.com/noknov/mini-claude-code/internal/api"
 
-// Session holds the conversation state
+// Session holds the conversation state: message history and token accounting.
 type Session struct {
-	Messages    []api.Message
+	Messages     []api.Message
 	InputTokens  int
 	OutputTokens int
 }
@@ -31,14 +29,14 @@ func (s *Session) AddAssistantMessage(blocks []api.ContentBlock) {
 	})
 }
 
-func (s *Session) AddToolResult(toolUseID, result string, isError bool) {
+func (s *Session) AddToolResult(toolUseID, content string, isError bool) {
 	s.Messages = append(s.Messages, api.Message{
 		Role: "user",
 		Content: []api.ContentBlock{
 			{
 				Type:      "tool_result",
 				ToolUseID: toolUseID,
-				Content:   result,
+				Content:   content,
 				IsError:   isError,
 			},
 		},
@@ -56,10 +54,12 @@ func (s *Session) Clear() {
 	s.OutputTokens = 0
 }
 
-// EstimateCost returns estimated cost in USD
+// EstimateCost returns an approximate cost in USD based on Claude Sonnet pricing.
 func (s *Session) EstimateCost() float64 {
-	// Approximate pricing for Claude Sonnet
-	inputCost := float64(s.InputTokens) / 1_000_000 * 3.0
-	outputCost := float64(s.OutputTokens) / 1_000_000 * 15.0
-	return inputCost + outputCost
+	const (
+		inputPricePerMTok  = 3.0
+		outputPricePerMTok = 15.0
+	)
+	return float64(s.InputTokens)/1e6*inputPricePerMTok +
+		float64(s.OutputTokens)/1e6*outputPricePerMTok
 }

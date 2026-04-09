@@ -11,6 +11,11 @@ import (
 
 const maxGlobResults = 200
 
+var globSkipDirs = map[string]bool{
+	".git": true, "node_modules": true, "__pycache__": true,
+	".next": true, "vendor": true, ".venv": true,
+}
+
 type GlobTool struct{}
 
 type globInput struct {
@@ -21,8 +26,9 @@ type globInput struct {
 func (t *GlobTool) Name() string { return "Glob" }
 
 func (t *GlobTool) Description() string {
-	return `Find files matching a glob pattern. Returns matching file paths sorted by modification time.
-Patterns not starting with "**/" are automatically prepended with "**/" for recursive search.`
+	return `Find files matching a glob pattern, sorted by modification time (newest first).
+Supports "**/" for recursive matching (e.g. "**/*.go").
+Automatically skips .git, node_modules, __pycache__, vendor, .venv.`
 }
 
 func (t *GlobTool) InputSchema() json.RawMessage {
@@ -31,7 +37,7 @@ func (t *GlobTool) InputSchema() json.RawMessage {
 		"properties": {
 			"pattern": {
 				"type": "string",
-				"description": "Glob pattern to match files (e.g. \"*.go\", \"**/*.ts\")"
+				"description": "Glob pattern (e.g. \"*.go\", \"**/*.ts\", \"src/**/*.jsx\")"
 			},
 			"path": {
 				"type": "string",
@@ -46,7 +52,7 @@ func (t *GlobTool) NeedsPermission(_ json.RawMessage) bool { return false }
 
 func (t *GlobTool) FormatPermissionRequest(input json.RawMessage) string {
 	var in globInput
-	json.Unmarshal(input, &in)
+	_ = json.Unmarshal(input, &in)
 	return fmt.Sprintf("Search files: %s", in.Pattern)
 }
 
@@ -62,33 +68,30 @@ func (t *GlobTool) Execute(input json.RawMessage, workDir string) (string, error
 	}
 
 	pattern := in.Pattern
-	if !strings.HasPrefix(pattern, "**/") && !strings.HasPrefix(pattern, "/") {
+	if !strings.Contains(pattern, "/") && !strings.HasPrefix(pattern, "**/") {
 		pattern = "**/" + pattern
 	}
 
-	type fileEntry struct {
+	type entry struct {
 		path    string
 		modTime int64
 	}
+	var matches []entry
 
-	var matches []fileEntry
-
-	filepath.Walk(searchDir, func(path string, info os.FileInfo, err error) error {
+	_ = filepath.Walk(searchDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
 		if info.IsDir() {
-			base := filepath.Base(path)
-			if base == ".git" || base == "node_modules" || base == "__pycache__" || base == ".next" {
+			if globSkipDirs[filepath.Base(path)] {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 
 		relPath, _ := filepath.Rel(searchDir, path)
-		matched, _ := filepath.Match(filepath.Base(pattern), filepath.Base(relPath))
-		if matched {
-			matches = append(matches, fileEntry{path: relPath, modTime: info.ModTime().Unix()})
+		if matchGlob(pattern, relPath) {
+			matches = append(matches, entry{path: relPath, modTime: info.ModTime().Unix()})
 		}
 		return nil
 	})
@@ -97,19 +100,82 @@ func (t *GlobTool) Execute(input json.RawMessage, workDir string) (string, error
 		return matches[i].modTime > matches[j].modTime
 	})
 
+	if len(matches) == 0 {
+		return "No files found matching pattern", nil
+	}
 	if len(matches) > maxGlobResults {
 		matches = matches[:maxGlobResults]
 	}
 
 	var sb strings.Builder
 	for _, m := range matches {
-		sb.WriteString(m.path)
-		sb.WriteString("\n")
+		sb.WriteString(m.path + "\n")
+	}
+	return fmt.Sprintf("Found %d file(s):\n%s", len(matches), sb.String()), nil
+}
+
+// matchGlob handles "**/" recursive patterns by splitting on "**/" and
+// matching each segment. For simple patterns without "**/" it falls back
+// to filepath.Match on the full relative path.
+func matchGlob(pattern, path string) bool {
+	if !strings.Contains(pattern, "**/") {
+		ok, _ := filepath.Match(pattern, path)
+		return ok
 	}
 
-	if len(matches) == 0 {
-		return "No files found matching pattern", nil
+	parts := strings.SplitN(pattern, "**/", 2)
+	prefix := parts[0]
+	suffix := parts[1]
+
+	if prefix != "" {
+		ok, _ := filepath.Match(strings.TrimSuffix(prefix, "/"), pathHead(path, strings.Count(prefix, "/")))
+		if !ok {
+			return false
+		}
 	}
 
-	return fmt.Sprintf("Found %d files:\n%s", len(matches), sb.String()), nil
+	if suffix == "" {
+		return true
+	}
+	if strings.Contains(suffix, "**/") {
+		// Nested **/ — match suffix recursively against every sub-path.
+		for i := 0; i < len(path); i++ {
+			if path[i] == '/' || i == 0 {
+				sub := path
+				if i > 0 {
+					sub = path[i+1:]
+				}
+				if matchGlob(suffix, sub) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	// suffix is a simple pattern like "*.go" or "foo/*.go"
+	// Match against every possible tail of path.
+	for i := len(path) - 1; i >= 0; i-- {
+		if path[i] == '/' || i == 0 {
+			tail := path[i:]
+			if i > 0 {
+				tail = path[i+1:]
+			}
+			if ok, _ := filepath.Match(suffix, tail); ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func pathHead(path string, depth int) string {
+	if depth <= 0 {
+		return ""
+	}
+	parts := strings.SplitN(path, "/", depth+1)
+	if len(parts) <= depth {
+		return path
+	}
+	return strings.Join(parts[:depth], "/")
 }

@@ -9,17 +9,18 @@ import (
 	"github.com/noknov/mini-claude-code/internal/config"
 )
 
+// ANSI escape sequences for terminal styling.
 const (
-	colorReset  = "\033[0m"
-	colorRed    = "\033[31m"
-	colorGreen  = "\033[32m"
-	colorYellow = "\033[33m"
-	colorBlue   = "\033[34m"
-	colorCyan   = "\033[36m"
-	colorDim    = "\033[2m"
-	colorBold   = "\033[1m"
+	reset  = "\033[0m"
+	red    = "\033[31m"
+	green  = "\033[32m"
+	yellow = "\033[33m"
+	cyan   = "\033[36m"
+	dim    = "\033[2m"
+	bold   = "\033[1m"
 )
 
+// Terminal handles all user-facing I/O.
 type Terminal struct {
 	cfg       *config.Config
 	reader    *bufio.Reader
@@ -33,26 +34,29 @@ func NewTerminal(cfg *config.Config) *Terminal {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Display helpers
+// ---------------------------------------------------------------------------
+
 func (t *Terminal) PrintWelcome(version, model, workDir string) {
-	fmt.Printf("\n%s╭─ mini-claude-code v%s ─╮%s\n", colorCyan, version, colorReset)
-	fmt.Printf("%s│%s Model: %s%s%s\n", colorCyan, colorReset, colorBold, model, colorReset)
-	fmt.Printf("%s│%s Dir:   %s\n", colorCyan, colorReset, workDir)
-	fmt.Printf("%s╰────────────────────────╯%s\n", colorCyan, colorReset)
-	fmt.Printf("%sTip: /help for commands, Ctrl+C to exit%s\n\n", colorDim, colorReset)
+	fmt.Printf("\n%s%s mini-claude-code%s v%s\n", bold, cyan, reset, version)
+	fmt.Printf("  Model: %s%s%s\n", bold, model, reset)
+	fmt.Printf("  Dir:   %s\n", workDir)
+	fmt.Printf("  %sTip: /help for commands, Ctrl+C to exit%s\n\n", dim, reset)
 }
 
 func (t *Terminal) ReadInput() (string, error) {
-	fmt.Printf("%s> %s", colorGreen, colorReset)
-	input, err := t.reader.ReadString('\n')
+	fmt.Printf("%s> %s", green, reset)
+	line, err := t.reader.ReadString('\n')
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(input), nil
+	return strings.TrimSpace(line), nil
 }
 
 func (t *Terminal) StartStreaming() {
 	t.streaming = true
-	fmt.Printf("\n%s", colorReset)
+	fmt.Print("\n")
 }
 
 func (t *Terminal) StreamText(text string) {
@@ -67,62 +71,57 @@ func (t *Terminal) StopStreaming() {
 }
 
 func (t *Terminal) PrintToolUse(name string, input interface{}) {
-	fmt.Printf("\n%s⚡ %s%s ", colorYellow, name, colorReset)
-	switch v := input.(type) {
-	case []byte:
-		compact := strings.ReplaceAll(string(v), "\n", " ")
-		if len(compact) > 100 {
-			compact = compact[:100] + "..."
-		}
-		fmt.Printf("%s%s%s\n", colorDim, compact, colorReset)
-	default:
-		fmt.Printf("%s%v%s\n", colorDim, v, colorReset)
-	}
+	summary := formatToolInput(input)
+	fmt.Printf("\n%s> %s%s %s%s%s\n", yellow, name, reset, dim, summary, reset)
 }
 
 func (t *Terminal) PrintToolResult(name, result string) {
 	lines := strings.Split(result, "\n")
 	if len(lines) > 10 {
-		for _, line := range lines[:5] {
-			fmt.Printf("  %s%s%s\n", colorDim, line, colorReset)
+		for _, l := range lines[:5] {
+			fmt.Printf("  %s%s%s\n", dim, l, reset)
 		}
-		fmt.Printf("  %s... (%d more lines)%s\n", colorDim, len(lines)-5, colorReset)
-	} else if len(result) > 0 {
-		for _, line := range lines {
-			fmt.Printf("  %s%s%s\n", colorDim, line, colorReset)
+		fmt.Printf("  %s... (%d more lines)%s\n", dim, len(lines)-5, reset)
+	} else if result != "" {
+		for _, l := range lines {
+			fmt.Printf("  %s%s%s\n", dim, l, reset)
 		}
 	}
 }
 
 func (t *Terminal) PrintToolError(name string, err error) {
-	fmt.Printf("  %s✗ %s: %v%s\n", colorRed, name, err, colorReset)
+	fmt.Printf("  %s✗ %s: %v%s\n", red, name, err, reset)
 }
 
 func (t *Terminal) PrintToolDenied(name string) {
-	fmt.Printf("  %s⊘ %s: permission denied%s\n", colorYellow, name, colorReset)
+	fmt.Printf("  %s⊘ %s: denied%s\n", yellow, name, reset)
 }
 
 func (t *Terminal) PrintError(err error) {
-	fmt.Printf("%s✗ Error: %v%s\n", colorRed, err, colorReset)
+	fmt.Printf("%s✗ Error: %v%s\n", red, err, reset)
 }
 
 func (t *Terminal) PrintInfo(msg string) {
-	fmt.Printf("%s%s%s\n", colorDim, msg, colorReset)
+	fmt.Printf("%s%s%s\n", dim, msg, reset)
 }
 
 func (t *Terminal) PrintSuccess(msg string) {
-	fmt.Printf("%s✓ %s%s\n", colorGreen, msg, colorReset)
+	fmt.Printf("%s✓ %s%s\n", green, msg, reset)
 }
 
-// AskPermission implements the permission.Asker interface
+// AskPermission implements the permission.Asker interface.
 func (t *Terminal) AskPermission(toolName, description string) string {
-	fmt.Printf("\n%s🔒 Permission needed: %s%s\n", colorYellow, description, colorReset)
-	fmt.Printf("   %sAllow? [Y/n/a(lways)] %s", colorDim, colorReset)
-	input, _ := t.reader.ReadString('\n')
-	return strings.TrimSpace(input)
+	fmt.Printf("\n%s? %s%s\n", yellow, description, reset)
+	fmt.Printf("  %sAllow? [Y/n/a(lways)] %s", dim, reset)
+	line, _ := t.reader.ReadString('\n')
+	return strings.TrimSpace(line)
 }
 
-// REPLEngine is the interface the REPL needs from the query engine
+// ---------------------------------------------------------------------------
+// REPL
+// ---------------------------------------------------------------------------
+
+// REPLEngine is the interface the REPL loop needs from the query engine.
 type REPLEngine interface {
 	Run(input string, terminal *Terminal)
 	SessionInfo() (inputTokens, outputTokens int, cost float64)
@@ -131,47 +130,38 @@ type REPLEngine interface {
 	GetModel() string
 }
 
-// RunREPL starts the interactive read-eval-print loop
 func (t *Terminal) RunREPL(engine REPLEngine) {
 	for {
 		input, err := t.ReadInput()
 		if err != nil {
 			break
 		}
-
 		if input == "" {
 			continue
 		}
-
 		if strings.HasPrefix(input, "/") {
 			if t.handleCommand(input, engine) {
 				continue
 			}
 		}
-
 		engine.Run(input, t)
 	}
 }
 
 func (t *Terminal) handleCommand(input string, engine REPLEngine) bool {
 	parts := strings.Fields(input)
-	cmd := parts[0]
-
-	switch cmd {
+	switch parts[0] {
 	case "/help":
 		t.printHelp()
-		return true
 	case "/clear":
 		engine.ClearSession()
 		t.PrintSuccess("Conversation cleared")
-		return true
 	case "/cost":
-		inputTokens, outputTokens, cost := engine.SessionInfo()
-		fmt.Printf("\n%sToken Usage:%s\n", colorBold, colorReset)
-		fmt.Printf("  Input:  %d tokens\n", inputTokens)
-		fmt.Printf("  Output: %d tokens\n", outputTokens)
+		in, out, cost := engine.SessionInfo()
+		fmt.Printf("\n%sToken Usage:%s\n", bold, reset)
+		fmt.Printf("  Input:  %d tokens\n", in)
+		fmt.Printf("  Output: %d tokens\n", out)
 		fmt.Printf("  Cost:   ~$%.4f\n\n", cost)
-		return true
 	case "/model":
 		if len(parts) > 1 {
 			engine.SetModel(parts[1])
@@ -179,24 +169,21 @@ func (t *Terminal) handleCommand(input string, engine REPLEngine) bool {
 		} else {
 			fmt.Printf("Current model: %s\n", engine.GetModel())
 		}
-		return true
+	case "/compact":
+		t.PrintInfo("Compact is not yet implemented")
 	case "/exit", "/quit":
 		fmt.Println("Goodbye!")
 		os.Exit(0)
-		return true
-	case "/compact":
-		t.PrintInfo("Compact not yet implemented in mini version")
-		return true
 	default:
-		t.PrintError(fmt.Errorf("unknown command: %s (try /help)", cmd))
-		return true
+		t.PrintError(fmt.Errorf("unknown command: %s (try /help)", parts[0]))
 	}
+	return true
 }
 
 func (t *Terminal) printHelp() {
 	fmt.Printf(`
-%sAvailable Commands:%s
-  /help       Show this help message
+%sCommands:%s
+  /help       Show this help
   /clear      Clear conversation history
   /cost       Show token usage and estimated cost
   /model      Show or change the current model
@@ -204,7 +191,25 @@ func (t *Terminal) printHelp() {
   /exit       Exit the program
 
 %sKeyboard:%s
-  Ctrl+C      Interrupt / Exit
+  Ctrl+C      Exit
 
-`, colorBold, colorReset, colorBold, colorReset)
+`, bold, reset, bold, reset)
+}
+
+// formatToolInput produces a short one-line summary of the tool input.
+func formatToolInput(input interface{}) string {
+	var s string
+	switch v := input.(type) {
+	case []byte:
+		s = string(v)
+	case string:
+		s = v
+	default:
+		s = fmt.Sprintf("%v", v)
+	}
+	s = strings.ReplaceAll(s, "\n", " ")
+	if len(s) > 120 {
+		return s[:120] + "..."
+	}
+	return s
 }

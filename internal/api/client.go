@@ -3,6 +3,7 @@ package api
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,9 +15,10 @@ import (
 const (
 	DefaultBaseURL = "https://api.anthropic.com"
 	APIVersion     = "2023-06-01"
-	MaxTokens      = 16384
+	DefaultMaxToks = 16384
 )
 
+// Client communicates with the Anthropic Messages API.
 type Client struct {
 	apiKey     string
 	model      string
@@ -38,38 +40,46 @@ func NewClient(apiKey, model, baseURL string) *Client {
 	}
 }
 
-func (c *Client) SetModel(model string) {
-	c.model = model
-}
+func (c *Client) SetModel(model string) { c.model = model }
+func (c *Client) Model() string         { return c.model }
 
-func (c *Client) Model() string {
-	return c.model
-}
-
+// ---------------------------------------------------------------------------
 // Request types
+// ---------------------------------------------------------------------------
 
+// Message is a single conversation turn sent to / received from the API.
 type Message struct {
-	Role    string        `json:"role"`
+	Role    string         `json:"role"`
 	Content []ContentBlock `json:"content"`
 }
 
+// ContentBlock is a polymorphic block inside a Message.
+// Only the fields relevant to the block's Type are populated.
 type ContentBlock struct {
-	Type      string          `json:"type"`
-	Text      string          `json:"text,omitempty"`
-	ID        string          `json:"id,omitempty"`
-	Name      string          `json:"name,omitempty"`
-	Input     json.RawMessage `json:"input,omitempty"`
-	ToolUseID string          `json:"tool_use_id,omitempty"`
-	Content   interface{}     `json:"content,omitempty"`
-	IsError   bool            `json:"is_error,omitempty"`
+	Type string `json:"type"`
+
+	// type: "text"
+	Text string `json:"text,omitempty"`
+
+	// type: "tool_use"
+	ID    string          `json:"id,omitempty"`
+	Name  string          `json:"name,omitempty"`
+	Input json.RawMessage `json:"input,omitempty"`
+
+	// type: "tool_result"
+	ToolUseID string `json:"tool_use_id,omitempty"`
+	Content   string `json:"content,omitempty"`
+	IsError   bool   `json:"is_error,omitempty"`
 }
 
+// ToolDef describes a tool for the API request.
 type ToolDef struct {
 	Name        string      `json:"name"`
 	Description string      `json:"description"`
 	InputSchema interface{} `json:"input_schema"`
 }
 
+// CreateMessageRequest is the body sent to POST /v1/messages.
 type CreateMessageRequest struct {
 	Model     string    `json:"model"`
 	MaxTokens int       `json:"max_tokens"`
@@ -79,19 +89,20 @@ type CreateMessageRequest struct {
 	Stream    bool      `json:"stream"`
 }
 
-// Response / streaming types
+// ---------------------------------------------------------------------------
+// SSE streaming types
+// ---------------------------------------------------------------------------
 
+// StreamEvent is a single parsed Server-Sent Event.
 type StreamEvent struct {
-	Type  string
-	Data  json.RawMessage
-	Index int
+	Type string
+	Data json.RawMessage
 }
 
 type MessageStartData struct {
-	Type  string       `json:"type"`
-	ID    string       `json:"id"`
-	Model string       `json:"model"`
-	Usage *UsageData   `json:"usage"`
+	ID    string     `json:"id"`
+	Model string     `json:"model"`
+	Usage *UsageData `json:"usage"`
 }
 
 type UsageData struct {
@@ -102,32 +113,33 @@ type UsageData struct {
 }
 
 type ContentBlockStartData struct {
-	Type         string       `json:"type"`
 	Index        int          `json:"index"`
 	ContentBlock ContentBlock `json:"content_block"`
 }
 
 type ContentBlockDeltaData struct {
-	Type  string     `json:"type"`
 	Index int        `json:"index"`
 	Delta DeltaBlock `json:"delta"`
 }
 
 type DeltaBlock struct {
-	Type        string          `json:"type"`
-	Text        string          `json:"text,omitempty"`
-	PartialJSON string          `json:"partial_json,omitempty"`
+	Type        string `json:"type"`
+	Text        string `json:"text,omitempty"`
+	PartialJSON string `json:"partial_json,omitempty"`
 }
 
 type MessageDeltaData struct {
-	Type  string     `json:"type"`
 	Delta struct {
 		StopReason string `json:"stop_reason"`
 	} `json:"delta"`
 	Usage *UsageData `json:"usage"`
 }
 
-// StreamResponse represents accumulated streaming data
+// ---------------------------------------------------------------------------
+// Accumulated response
+// ---------------------------------------------------------------------------
+
+// StreamResponse is the fully-assembled result after consuming all SSE events.
 type StreamResponse struct {
 	ID            string
 	Model         string
@@ -137,9 +149,15 @@ type StreamResponse struct {
 	OutputTokens  int
 }
 
-// CreateMessageStream sends a streaming request and returns a channel of events
-func (c *Client) CreateMessageStream(req CreateMessageRequest) (<-chan StreamEvent, <-chan error) {
-	eventCh := make(chan StreamEvent, 100)
+// ---------------------------------------------------------------------------
+// Streaming
+// ---------------------------------------------------------------------------
+
+// CreateMessageStream sends a streaming request and returns channels for
+// events and errors. The caller should range over eventCh; errCh delivers
+// at most one error after eventCh is closed.
+func (c *Client) CreateMessageStream(ctx context.Context, req CreateMessageRequest) (<-chan StreamEvent, <-chan error) {
+	eventCh := make(chan StreamEvent, 64)
 	errCh := make(chan error, 1)
 
 	req.Stream = true
@@ -147,7 +165,7 @@ func (c *Client) CreateMessageStream(req CreateMessageRequest) (<-chan StreamEve
 		req.Model = c.model
 	}
 	if req.MaxTokens == 0 {
-		req.MaxTokens = MaxTokens
+		req.MaxTokens = DefaultMaxToks
 	}
 
 	go func() {
@@ -160,12 +178,11 @@ func (c *Client) CreateMessageStream(req CreateMessageRequest) (<-chan StreamEve
 			return
 		}
 
-		httpReq, err := http.NewRequest("POST", c.baseURL+"/v1/messages", bytes.NewReader(body))
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/v1/messages", bytes.NewReader(body))
 		if err != nil {
 			errCh <- fmt.Errorf("create request: %w", err)
 			return
 		}
-
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("X-API-Key", c.apiKey)
 		httpReq.Header.Set("anthropic-version", APIVersion)
@@ -178,32 +195,26 @@ func (c *Client) CreateMessageStream(req CreateMessageRequest) (<-chan StreamEve
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			bodyBytes, _ := io.ReadAll(resp.Body)
-			errCh <- fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(bodyBytes))
+			respBody, _ := io.ReadAll(resp.Body)
+			errCh <- fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBody))
 			return
 		}
 
 		scanner := bufio.NewScanner(resp.Body)
-		scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
+		scanner.Buffer(make([]byte, 0, 1<<20), 1<<20)
 
 		var eventType string
 		for scanner.Scan() {
 			line := scanner.Text()
-
 			if strings.HasPrefix(line, "event: ") {
 				eventType = strings.TrimPrefix(line, "event: ")
 				continue
 			}
-
 			if strings.HasPrefix(line, "data: ") {
 				data := strings.TrimPrefix(line, "data: ")
-				eventCh <- StreamEvent{
-					Type: eventType,
-					Data: json.RawMessage(data),
-				}
+				eventCh <- StreamEvent{Type: eventType, Data: json.RawMessage(data)}
 			}
 		}
-
 		if err := scanner.Err(); err != nil {
 			errCh <- fmt.Errorf("read stream: %w", err)
 		}

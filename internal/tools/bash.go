@@ -9,8 +9,8 @@ import (
 )
 
 const (
-	bashMaxOutput  = 30000
-	bashTimeoutSec = 120
+	bashDefaultTimeout = 120 * time.Second
+	bashMaxOutput      = 30000
 )
 
 type BashTool struct{}
@@ -23,9 +23,9 @@ type bashInput struct {
 func (t *BashTool) Name() string { return "Bash" }
 
 func (t *BashTool) Description() string {
-	return `Execute a shell command. Use for running scripts, installing packages, git operations, file system operations, compiling code, running tests, and any other command-line tasks.
-Commands run in the user's shell environment with their PATH and aliases.
-Long-running commands will be terminated after the timeout.`
+	return `Execute a shell command in bash.
+Use for running scripts, installing packages, git operations, compiling code, running tests, and any other CLI tasks.
+Long-running commands are terminated after the timeout (default 120 s).`
 }
 
 func (t *BashTool) InputSchema() json.RawMessage {
@@ -45,13 +45,11 @@ func (t *BashTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *BashTool) NeedsPermission(input json.RawMessage) bool {
-	return true
-}
+func (t *BashTool) NeedsPermission(_ json.RawMessage) bool { return true }
 
 func (t *BashTool) FormatPermissionRequest(input json.RawMessage) string {
 	var in bashInput
-	json.Unmarshal(input, &in)
+	_ = json.Unmarshal(input, &in)
 	return fmt.Sprintf("Run command: %s", in.Command)
 }
 
@@ -60,12 +58,11 @@ func (t *BashTool) Execute(input json.RawMessage, workDir string) (string, error
 	if err := json.Unmarshal(input, &in); err != nil {
 		return "", fmt.Errorf("invalid input: %w", err)
 	}
-
 	if in.Command == "" {
 		return "", fmt.Errorf("command is required")
 	}
 
-	timeout := time.Duration(bashTimeoutSec) * time.Second
+	timeout := bashDefaultTimeout
 	if in.TimeoutMs > 0 {
 		timeout = time.Duration(in.TimeoutMs) * time.Millisecond
 	}
@@ -73,37 +70,39 @@ func (t *BashTool) Execute(input json.RawMessage, workDir string) (string, error
 	cmd := exec.Command("bash", "-c", in.Command)
 	cmd.Dir = workDir
 
-	done := make(chan struct{})
-	var output []byte
-	var cmdErr error
-
+	type result struct {
+		output []byte
+		err    error
+	}
+	ch := make(chan result, 1)
 	go func() {
-		output, cmdErr = cmd.CombinedOutput()
-		close(done)
+		out, err := cmd.CombinedOutput()
+		ch <- result{out, err}
 	}()
 
 	select {
-	case <-done:
+	case r := <-ch:
+		return formatBashOutput(r.output, r.err)
 	case <-time.After(timeout):
 		if cmd.Process != nil {
-			cmd.Process.Kill()
+			_ = cmd.Process.Kill()
 		}
 		return "", fmt.Errorf("command timed out after %v", timeout)
 	}
+}
 
-	result := string(output)
-	if len(result) > bashMaxOutput {
+func formatBashOutput(output []byte, cmdErr error) (string, error) {
+	text := string(output)
+	if len(text) > bashMaxOutput {
 		half := bashMaxOutput / 2
-		result = result[:half] + "\n\n... [output truncated] ...\n\n" + result[len(result)-half:]
+		text = text[:half] + "\n\n... [output truncated] ...\n\n" + text[len(text)-half:]
 	}
 
-	if cmdErr != nil {
-		exitErr, ok := cmdErr.(*exec.ExitError)
-		if ok {
-			return fmt.Sprintf("%s\nExit code: %d", result, exitErr.ExitCode()), nil
-		}
-		return result, fmt.Errorf("command failed: %w", cmdErr)
+	if cmdErr == nil {
+		return strings.TrimRight(text, "\n"), nil
 	}
-
-	return strings.TrimRight(result, "\n"), nil
+	if exitErr, ok := cmdErr.(*exec.ExitError); ok {
+		return fmt.Sprintf("%s\nExit code: %d", text, exitErr.ExitCode()), nil
+	}
+	return text, fmt.Errorf("command failed: %w", cmdErr)
 }

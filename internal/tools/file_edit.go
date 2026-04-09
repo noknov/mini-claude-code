@@ -19,9 +19,9 @@ type fileEditInput struct {
 func (t *FileEditTool) Name() string { return "Edit" }
 
 func (t *FileEditTool) Description() string {
-	return `Edit a file by replacing an exact string match with new content.
-The old_string must uniquely identify the text to replace (unless replace_all is true).
-Use this for surgical edits rather than rewriting entire files.`
+	return `Replace an exact string in a file with new content.
+The old_string must uniquely identify the target (unless replace_all is true).
+Prefer this over Write for surgical modifications to existing files.`
 }
 
 func (t *FileEditTool) InputSchema() json.RawMessage {
@@ -34,7 +34,7 @@ func (t *FileEditTool) InputSchema() json.RawMessage {
 			},
 			"old_string": {
 				"type": "string",
-				"description": "The exact text to find and replace"
+				"description": "The exact text to find"
 			},
 			"new_string": {
 				"type": "string",
@@ -49,13 +49,11 @@ func (t *FileEditTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *FileEditTool) NeedsPermission(_ json.RawMessage) bool {
-	return true
-}
+func (t *FileEditTool) NeedsPermission(_ json.RawMessage) bool { return true }
 
 func (t *FileEditTool) FormatPermissionRequest(input json.RawMessage) string {
 	var in fileEditInput
-	json.Unmarshal(input, &in)
+	_ = json.Unmarshal(input, &in)
 	return fmt.Sprintf("Edit file: %s", in.Path)
 }
 
@@ -85,25 +83,19 @@ func (t *FileEditTool) Execute(input json.RawMessage, workDir string) (string, e
 	if count == 0 {
 		return "", fmt.Errorf("old_string not found in file")
 	}
-
 	if count > 1 && !in.ReplaceAll {
-		return "", fmt.Errorf("old_string found %d times; use replace_all or provide more context to make it unique", count)
+		return "", fmt.Errorf("old_string found %d times; use replace_all or provide more context", count)
 	}
 
-	var newContent string
+	replacements := 1
+	newContent := strings.Replace(content, in.OldString, in.NewString, 1)
 	if in.ReplaceAll {
+		replacements = count
 		newContent = strings.ReplaceAll(content, in.OldString, in.NewString)
-	} else {
-		newContent = strings.Replace(content, in.OldString, in.NewString, 1)
 	}
 
 	if err := os.WriteFile(path, []byte(newContent), 0644); err != nil {
 		return "", fmt.Errorf("write file: %w", err)
-	}
-
-	replacements := count
-	if !in.ReplaceAll {
-		replacements = 1
 	}
 	return fmt.Sprintf("Replaced %d occurrence(s) in %s", replacements, path), nil
 }

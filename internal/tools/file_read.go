@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-const maxFileSize = 1024 * 1024 // 1MB
+const maxReadSize = 1 << 20 // 1 MB
 
 type FileReadTool struct{}
 
@@ -21,9 +21,9 @@ type fileReadInput struct {
 func (t *FileReadTool) Name() string { return "Read" }
 
 func (t *FileReadTool) Description() string {
-	return `Read the contents of a file. Supports text files with optional line range selection.
-Use offset and limit to read specific portions of large files.
-Lines are 1-indexed in the output.`
+	return `Read a file or list a directory.
+For files: returns content with line numbers (1-indexed).
+Use offset and limit to read a specific range of lines.`
 }
 
 func (t *FileReadTool) InputSchema() json.RawMessage {
@@ -32,28 +32,26 @@ func (t *FileReadTool) InputSchema() json.RawMessage {
 		"properties": {
 			"path": {
 				"type": "string",
-				"description": "Absolute path to the file to read"
+				"description": "Absolute path to the file or directory"
 			},
 			"offset": {
 				"type": "integer",
-				"description": "Line number to start reading from (1-indexed)"
+				"description": "Starting line number (1-indexed)"
 			},
 			"limit": {
 				"type": "integer",
-				"description": "Number of lines to read"
+				"description": "Maximum number of lines to read"
 			}
 		},
 		"required": ["path"]
 	}`)
 }
 
-func (t *FileReadTool) NeedsPermission(_ json.RawMessage) bool {
-	return false
-}
+func (t *FileReadTool) NeedsPermission(_ json.RawMessage) bool { return false }
 
 func (t *FileReadTool) FormatPermissionRequest(input json.RawMessage) string {
 	var in fileReadInput
-	json.Unmarshal(input, &in)
+	_ = json.Unmarshal(input, &in)
 	return fmt.Sprintf("Read file: %s", in.Path)
 }
 
@@ -70,15 +68,14 @@ func (t *FileReadTool) Execute(input json.RawMessage, workDir string) (string, e
 		if os.IsNotExist(err) {
 			return "", fmt.Errorf("file not found: %s", path)
 		}
-		return "", fmt.Errorf("stat file: %w", err)
+		return "", fmt.Errorf("stat: %w", err)
 	}
 
 	if info.IsDir() {
 		return readDirectory(path)
 	}
-
-	if info.Size() > maxFileSize {
-		return "", fmt.Errorf("file too large (%d bytes, max %d)", info.Size(), maxFileSize)
+	if info.Size() > maxReadSize {
+		return "", fmt.Errorf("file too large (%d bytes, max %d)", info.Size(), maxReadSize)
 	}
 
 	data, err := os.ReadFile(path)
@@ -87,38 +84,29 @@ func (t *FileReadTool) Execute(input json.RawMessage, workDir string) (string, e
 	}
 
 	lines := strings.Split(string(data), "\n")
-
-	if in.Offset > 0 || in.Limit > 0 {
-		start := 0
-		if in.Offset > 0 {
-			start = in.Offset - 1
-		}
-		if start >= len(lines) {
-			return "", fmt.Errorf("offset %d exceeds file length (%d lines)", in.Offset, len(lines))
-		}
-
-		end := len(lines)
-		if in.Limit > 0 {
-			end = start + in.Limit
-			if end > len(lines) {
-				end = len(lines)
-			}
-		}
-		lines = lines[start:end]
-
-		var sb strings.Builder
-		for i, line := range lines {
-			lineNum := start + i + 1
-			sb.WriteString(fmt.Sprintf("%6d|%s\n", lineNum, line))
-		}
-		return sb.String(), nil
-	}
+	start, end := lineRange(lines, in.Offset, in.Limit)
 
 	var sb strings.Builder
-	for i, line := range lines {
-		sb.WriteString(fmt.Sprintf("%6d|%s\n", i+1, line))
+	for i := start; i < end; i++ {
+		fmt.Fprintf(&sb, "%6d|%s\n", i+1, lines[i])
 	}
 	return sb.String(), nil
+}
+
+// lineRange converts 1-indexed offset/limit into 0-indexed [start, end).
+func lineRange(lines []string, offset, limit int) (start, end int) {
+	start = 0
+	if offset > 0 {
+		start = offset - 1
+	}
+	if start > len(lines) {
+		start = len(lines)
+	}
+	end = len(lines)
+	if limit > 0 && start+limit < end {
+		end = start + limit
+	}
+	return start, end
 }
 
 func readDirectory(path string) (string, error) {
@@ -126,15 +114,14 @@ func readDirectory(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read directory: %w", err)
 	}
-
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Directory: %s\n\n", path))
-	for _, entry := range entries {
-		prefix := "  "
-		if entry.IsDir() {
-			prefix = "📁"
+	fmt.Fprintf(&sb, "Directory: %s\n\n", path)
+	for _, e := range entries {
+		indicator := "  "
+		if e.IsDir() {
+			indicator = "d "
 		}
-		sb.WriteString(fmt.Sprintf("%s %s\n", prefix, entry.Name()))
+		sb.WriteString(indicator + e.Name() + "\n")
 	}
 	return sb.String(), nil
 }

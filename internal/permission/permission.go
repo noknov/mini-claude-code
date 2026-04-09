@@ -1,56 +1,49 @@
 package permission
 
-import (
-	"strings"
-)
+import "strings"
 
-// Manager handles tool permission checks
-type Manager struct {
-	mode      string // "ask", "auto", "deny"
-	allowOnce map[string]bool
-	allowAll  map[string]bool
-}
-
-// Asker is the interface for asking user permission
+// Asker is the interface for prompting the user for permission.
 type Asker interface {
 	AskPermission(toolName, description string) string
 }
 
+// Manager handles tool execution permission checks.
+type Manager struct {
+	mode     string          // "ask", "auto", "deny"
+	alwaysOK map[string]bool // tools the user has permanently approved
+}
+
 func NewManager(mode string) *Manager {
 	return &Manager{
-		mode:      mode,
-		allowOnce: make(map[string]bool),
-		allowAll:  make(map[string]bool),
+		mode:     mode,
+		alwaysOK: make(map[string]bool),
 	}
 }
 
-// Check returns true if the tool is allowed to execute
+// Check returns true if the tool is allowed to execute.
+// In "ask" mode it prompts the user via the Asker interface.
 func (m *Manager) Check(toolName, description string, asker Asker) bool {
-	if m.mode == "auto" {
+	switch m.mode {
+	case "auto":
 		return true
-	}
-	if m.mode == "deny" {
+	case "deny":
 		return false
 	}
 
-	if m.allowAll[toolName] {
+	if m.alwaysOK[toolName] {
 		return true
 	}
 
-	response := asker.AskPermission(toolName, description)
-	response = strings.TrimSpace(strings.ToLower(response))
-
-	switch response {
+	resp := strings.TrimSpace(strings.ToLower(asker.AskPermission(toolName, description)))
+	switch resp {
 	case "y", "yes", "":
 		return true
 	case "a", "always":
-		m.allowAll[toolName] = true
+		m.alwaysOK[toolName] = true
 		return true
 	default:
 		return false
 	}
 }
 
-func (m *Manager) SetMode(mode string) {
-	m.mode = mode
-}
+func (m *Manager) SetMode(mode string) { m.mode = mode }
