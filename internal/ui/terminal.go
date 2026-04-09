@@ -4,6 +4,7 @@ package ui
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -126,7 +127,7 @@ func (t *Terminal) AskPermission(toolName, description string) string {
 // REPLEngine is the interface the REPL loop needs from the query engine.
 type REPLEngine interface {
 	Run(input string, terminal *Terminal)
-	SessionInfo() (inputTokens, outputTokens int, cost float64)
+	SessionInfo() (inputTokens, outputTokens int)
 	ClearSession()
 	SetModel(model string)
 	GetModel() string
@@ -166,7 +167,7 @@ func (t *Terminal) handleCommand(input string, engine REPLEngine) bool {
 		engine.ClearSession()
 		t.PrintSuccess("Conversation cleared")
 	case "/cost":
-		t.printCost(engine)
+		t.printTokenUsage(engine)
 	case "/model":
 		t.handleModelCommand(parts, engine)
 	case "/compact":
@@ -193,12 +194,11 @@ func (t *Terminal) handleCommand(input string, engine REPLEngine) bool {
 	return true
 }
 
-func (t *Terminal) printCost(engine REPLEngine) {
-	in, out, cost := engine.SessionInfo()
+func (t *Terminal) printTokenUsage(engine REPLEngine) {
+	in, out := engine.SessionInfo()
 	fmt.Printf("\n%sToken Usage:%s\n", bold, reset)
 	fmt.Printf("  Input:  %d tokens\n", in)
-	fmt.Printf("  Output: %d tokens\n", out)
-	fmt.Printf("  Cost:   ~$%.4f\n\n", cost)
+	fmt.Printf("  Output: %d tokens\n\n", out)
 }
 
 func (t *Terminal) handleModelCommand(parts []string, engine REPLEngine) {
@@ -263,6 +263,8 @@ func (t *Terminal) printHelp() {
 func formatToolInput(input interface{}) string {
 	var s string
 	switch v := input.(type) {
+	case json.RawMessage:
+		s = string(v)
 	case []byte:
 		s = string(v)
 	case string:

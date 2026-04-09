@@ -5,6 +5,7 @@ package config
 
 import (
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -19,6 +20,7 @@ type Config struct {
 	APIKey         string
 	Model          string
 	BaseURL        string
+	ContextWindow  int // 0 = use provider default
 	WorkDir        string
 	PermissionMode string // "ask" (default), "auto", "deny", "plan"
 
@@ -40,7 +42,7 @@ func Load() (*Config, error) {
 		PermissionMode: "ask",
 	}
 
-	cfg.APIKey, cfg.BaseURL, cfg.Model = loadProviderConfig(cfg.Provider)
+	cfg.APIKey, cfg.BaseURL, cfg.Model, cfg.ContextWindow = loadProviderConfig(cfg.Provider)
 	cfg.applyFlags()
 
 	return cfg, nil
@@ -57,7 +59,10 @@ func detectProvider() string {
 	return "anthropic"
 }
 
-func loadProviderConfig(prov string) (apiKey, baseURL, model string) {
+func loadProviderConfig(prov string) (apiKey, baseURL, model string, contextWindow int) {
+	if v := os.Getenv("CONTEXT_WINDOW"); v != "" {
+		contextWindow, _ = strconv.Atoi(v)
+	}
 	switch prov {
 	case "openai":
 		apiKey = os.Getenv("OPENAI_API_KEY")
@@ -87,7 +92,7 @@ func (cfg *Config) applyFlags() {
 		case "--provider":
 			if i+1 < len(args) {
 				cfg.Provider = args[i+1]
-				cfg.APIKey, cfg.BaseURL, cfg.Model = loadProviderConfig(cfg.Provider)
+				cfg.APIKey, cfg.BaseURL, cfg.Model, cfg.ContextWindow = loadProviderConfig(cfg.Provider)
 				i++
 			}
 		case "--auto":

@@ -12,46 +12,44 @@ import (
 	"time"
 )
 
-const (
-	openaiDefaultURL  = "https://api.openai.com"
-	openaiDefaultToks = 16384
-)
+const openaiDefaultURL = "https://api.openai.com"
 
 // OpenAI implements Provider for the OpenAI Chat Completions API.
 // Also works with any OpenAI-compatible endpoint (Ollama, vLLM, Together, etc.).
 type OpenAI struct {
-	apiKey  string
-	model   string
-	baseURL string
-	client  *http.Client
+	apiKey        string
+	model         string
+	baseURL       string
+	contextWindow int
+	client        *http.Client
 }
 
-func NewOpenAI(apiKey, model, baseURL string) *OpenAI {
+func NewOpenAI(apiKey, model, baseURL string, contextWindow int) *OpenAI {
 	if baseURL == "" {
 		baseURL = openaiDefaultURL
 	}
+	if contextWindow <= 0 {
+		contextWindow = 128000
+	}
 	return &OpenAI{
-		apiKey:  apiKey,
-		model:   model,
-		baseURL: strings.TrimRight(baseURL, "/"),
-		client:  &http.Client{Timeout: 10 * time.Minute},
+		apiKey:        apiKey,
+		model:         model,
+		baseURL:       strings.TrimRight(baseURL, "/"),
+		contextWindow: contextWindow,
+		client:        &http.Client{Timeout: 10 * time.Minute},
 	}
 }
 
-func (o *OpenAI) Name() string      { return "openai" }
-func (o *OpenAI) Model() string     { return o.model }
-func (o *OpenAI) SetModel(m string) { o.model = m }
+func (o *OpenAI) Name() string       { return "openai" }
+func (o *OpenAI) Model() string      { return o.model }
+func (o *OpenAI) SetModel(m string)  { o.model = m }
+func (o *OpenAI) ContextWindow() int { return o.contextWindow }
 
 func (o *OpenAI) SendStream(ctx context.Context, req Request) (<-chan StreamEvent, <-chan error) {
 	eventCh := make(chan StreamEvent, 64)
 	errCh := make(chan error, 1)
 
-	maxToks := req.MaxTokens
-	if maxToks == 0 {
-		maxToks = openaiDefaultToks
-	}
-
-	apiReq := o.buildRequest(req, maxToks)
+	apiReq := o.buildRequest(req)
 
 	go func() {
 		defer close(eventCh)
@@ -93,7 +91,7 @@ func (o *OpenAI) SendStream(ctx context.Context, req Request) (<-chan StreamEven
 }
 
 // buildRequest converts our generic Request into an OpenAI-shaped payload.
-func (o *OpenAI) buildRequest(req Request, maxToks int) map[string]interface{} {
+func (o *OpenAI) buildRequest(req Request) map[string]interface{} {
 	msgs := make([]map[string]interface{}, 0, len(req.Messages)+1)
 
 	if req.SystemPrompt != "" {
@@ -108,13 +106,16 @@ func (o *OpenAI) buildRequest(req Request, maxToks int) map[string]interface{} {
 	}
 
 	result := map[string]interface{}{
-		"model":      o.model,
-		"max_tokens": maxToks,
-		"messages":   msgs,
-		"stream":     true,
+		"model":    o.model,
+		"messages": msgs,
+		"stream":   true,
 		"stream_options": map[string]interface{}{
 			"include_usage": true,
 		},
+	}
+
+	if req.MaxTokens > 0 {
+		result["max_tokens"] = req.MaxTokens
 	}
 
 	if len(req.Tools) > 0 {
@@ -186,8 +187,11 @@ func convertAssistantMessage(m Message) map[string]interface{} {
 		}
 	}
 
-	if len(textParts) > 0 {
+	switch {
+	case len(textParts) > 0:
 		msg["content"] = strings.Join(textParts, "\n")
+	case len(toolCalls) == 0:
+		msg["content"] = ""
 	}
 	if len(toolCalls) > 0 {
 		msg["tool_calls"] = toolCalls
@@ -195,17 +199,92 @@ func convertAssistantMessage(m Message) map[string]interface{} {
 	return msg
 }
 
+// ---------------------------------------------------------------------------
+// SSE stream parsing
+// ---------------------------------------------------------------------------
+
+// sseChunk maps the JSON structure of a single SSE data line.
+type sseChunk struct {
+	ID      string           `json:"id"`
+	Model   string           `json:"model"`
+	Choices []sseChunkChoice `json:"choices"`
+	Usage   *sseUsage        `json:"usage"`
+}
+
+type sseChunkChoice struct {
+	Delta        sseChunkDelta `json:"delta"`
+	FinishReason *string       `json:"finish_reason"`
+}
+
+type sseChunkDelta struct {
+	Content   *string            `json:"content"`
+	ToolCalls []sseChunkToolCall `json:"tool_calls,omitempty"`
+}
+
+type sseChunkToolCall struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id,omitempty"`
+	Function struct {
+		Name      string `json:"name,omitempty"`
+		Arguments string `json:"arguments,omitempty"`
+	} `json:"function"`
+}
+
+type sseUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+}
+
+// pendingToolCall accumulates streamed fragments of a single tool call.
+type pendingToolCall struct {
+	id   string
+	name string
+	args strings.Builder
+}
+
+// streamAccumulator collects streamed content into a final Response.
+type streamAccumulator struct {
+	result  Response
+	textBuf strings.Builder
+	tools   map[int]*pendingToolCall
+}
+
+func newStreamAccumulator() *streamAccumulator {
+	return &streamAccumulator{tools: make(map[int]*pendingToolCall)}
+}
+
+func (a *streamAccumulator) flushText() {
+	if a.textBuf.Len() == 0 {
+		return
+	}
+	a.result.ContentBlocks = append(a.result.ContentBlocks, ContentBlock{
+		Type: "text",
+		Text: a.textBuf.String(),
+	})
+	a.textBuf.Reset()
+}
+
+func (a *streamAccumulator) flushTools(eventCh chan<- StreamEvent) {
+	for _, tc := range a.tools {
+		a.result.ContentBlocks = append(a.result.ContentBlocks, ContentBlock{
+			Type:  "tool_use",
+			ID:    tc.id,
+			Name:  tc.name,
+			Input: json.RawMessage(tc.args.String()),
+		})
+		eventCh <- StreamEvent{Type: "tool_use_end"}
+	}
+}
+
+func (a *streamAccumulator) finalize(eventCh chan<- StreamEvent) {
+	a.flushText()
+	eventCh <- StreamEvent{Type: "done", Response: &a.result}
+}
+
 func (o *OpenAI) parseSSE(r io.Reader, eventCh chan<- StreamEvent, errCh chan<- error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 1<<20), 1<<20)
-
-	var result Response
-	// Track active tool calls by index.
-	activeTools := make(map[int]*struct {
-		id   string
-		name string
-		args strings.Builder
-	})
+	acc := newStreamAccumulator()
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -214,100 +293,81 @@ func (o *OpenAI) parseSSE(r io.Reader, eventCh chan<- StreamEvent, errCh chan<- 
 		}
 		data := strings.TrimPrefix(line, "data: ")
 		if data == "[DONE]" {
-			eventCh <- StreamEvent{Type: "done", Response: &result}
+			acc.finalize(eventCh)
 			return
 		}
 
-		var chunk struct {
-			ID      string `json:"id"`
-			Model   string `json:"model"`
-			Choices []struct {
-				Delta struct {
-					Content   *string `json:"content"`
-					ToolCalls []struct {
-						Index    int    `json:"index"`
-						ID       string `json:"id,omitempty"`
-						Function struct {
-							Name      string `json:"name,omitempty"`
-							Arguments string `json:"arguments,omitempty"`
-						} `json:"function"`
-					} `json:"tool_calls,omitempty"`
-				} `json:"delta"`
-				FinishReason *string `json:"finish_reason"`
-			} `json:"choices"`
-			Usage *struct {
-				PromptTokens     int `json:"prompt_tokens"`
-				CompletionTokens int `json:"completion_tokens"`
-			} `json:"usage"`
-		}
+		var chunk sseChunk
 		if json.Unmarshal([]byte(data), &chunk) != nil {
 			continue
 		}
 
-		if chunk.ID != "" {
-			result.ID = chunk.ID
-		}
-		if chunk.Model != "" {
-			result.Model = chunk.Model
-		}
-		if chunk.Usage != nil {
-			result.InputTokens = chunk.Usage.PromptTokens
-			result.OutputTokens = chunk.Usage.CompletionTokens
-		}
+		acc.updateMetadata(&chunk)
 
 		if len(chunk.Choices) == 0 {
 			continue
 		}
 		choice := chunk.Choices[0]
 
-		if choice.Delta.Content != nil && *choice.Delta.Content != "" {
-			eventCh <- StreamEvent{Type: "text", Text: *choice.Delta.Content}
-		}
-
-		for _, tc := range choice.Delta.ToolCalls {
-			at, exists := activeTools[tc.Index]
-			if !exists {
-				at = &struct {
-					id   string
-					name string
-					args strings.Builder
-				}{}
-				activeTools[tc.Index] = at
-			}
-			if tc.ID != "" {
-				at.id = tc.ID
-			}
-			if tc.Function.Name != "" {
-				at.name = tc.Function.Name
-				eventCh <- StreamEvent{
-					Type:     "tool_use_start",
-					ToolID:   at.id,
-					ToolName: at.name,
-				}
-			}
-			if tc.Function.Arguments != "" {
-				at.args.WriteString(tc.Function.Arguments)
-				eventCh <- StreamEvent{Type: "tool_input_delta", PartialJSON: tc.Function.Arguments}
-			}
-		}
+		acc.processTextDelta(choice.Delta.Content, eventCh)
+		acc.processToolDeltas(choice.Delta.ToolCalls, eventCh)
 
 		if choice.FinishReason != nil {
-			result.StopReason = *choice.FinishReason
-
-			// Finalize all tool call blocks.
-			for _, at := range activeTools {
-				result.ContentBlocks = append(result.ContentBlocks, ContentBlock{
-					Type:  "tool_use",
-					ID:    at.id,
-					Name:  at.name,
-					Input: json.RawMessage(at.args.String()),
-				})
-				eventCh <- StreamEvent{Type: "tool_use_end"}
-			}
+			acc.result.StopReason = *choice.FinishReason
+			acc.flushText()
+			acc.flushTools(eventCh)
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
 		errCh <- fmt.Errorf("read stream: %w", err)
 	}
+}
+
+func (a *streamAccumulator) updateMetadata(chunk *sseChunk) {
+	if chunk.ID != "" {
+		a.result.ID = chunk.ID
+	}
+	if chunk.Model != "" {
+		a.result.Model = chunk.Model
+	}
+	if chunk.Usage != nil {
+		a.result.InputTokens = chunk.Usage.PromptTokens
+		a.result.OutputTokens = chunk.Usage.CompletionTokens
+	}
+}
+
+func (a *streamAccumulator) processTextDelta(content *string, eventCh chan<- StreamEvent) {
+	if content == nil || *content == "" {
+		return
+	}
+	a.textBuf.WriteString(*content)
+	eventCh <- StreamEvent{Type: "text", Text: *content}
+}
+
+func (a *streamAccumulator) processToolDeltas(deltas []sseChunkToolCall, eventCh chan<- StreamEvent) {
+	for _, tc := range deltas {
+		pending := a.getOrCreateTool(tc.Index)
+
+		if tc.ID != "" {
+			pending.id = tc.ID
+		}
+		if tc.Function.Name != "" {
+			pending.name = tc.Function.Name
+			eventCh <- StreamEvent{Type: "tool_use_start", ToolID: pending.id, ToolName: pending.name}
+		}
+		if tc.Function.Arguments != "" {
+			pending.args.WriteString(tc.Function.Arguments)
+			eventCh <- StreamEvent{Type: "tool_input_delta", PartialJSON: tc.Function.Arguments}
+		}
+	}
+}
+
+func (a *streamAccumulator) getOrCreateTool(index int) *pendingToolCall {
+	if tc, ok := a.tools[index]; ok {
+		return tc
+	}
+	tc := &pendingToolCall{}
+	a.tools[index] = tc
+	return tc
 }

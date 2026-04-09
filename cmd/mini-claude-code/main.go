@@ -73,7 +73,7 @@ func handleMetaFlags() bool {
 func createProvider(cfg *config.Config) provider.Provider {
 	switch cfg.Provider {
 	case "openai":
-		return provider.NewOpenAI(cfg.APIKey, cfg.Model, cfg.BaseURL)
+		return provider.NewOpenAI(cfg.APIKey, cfg.Model, cfg.BaseURL, cfg.ContextWindow)
 	default:
 		return provider.NewAnthropic(cfg.APIKey, cfg.Model, cfg.BaseURL)
 	}
@@ -97,7 +97,12 @@ func setupSignalHandler(engine *query.Engine) {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		for range sig {
-			engine.Cancel()
+			if engine.IsRunning() {
+				engine.Cancel()
+			} else {
+				fmt.Println("\nGoodbye!")
+				os.Exit(0)
+			}
 		}
 	}()
 }
@@ -107,12 +112,12 @@ func setupSignalHandler(engine *query.Engine) {
 // ---------------------------------------------------------------------------
 
 func printMissingKeyHelp(prov string) {
-	fmt.Fprintf(os.Stderr, "API key is not set.\n")
-	if prov == "openai" {
-		fmt.Fprintln(os.Stderr, "Set OPENAI_API_KEY environment variable.")
-	} else {
-		fmt.Fprintln(os.Stderr, "Set ANTHROPIC_API_KEY environment variable.")
-	}
+	fmt.Fprintf(os.Stderr, "API key is not set (provider: %s).\n\n", prov)
+	fmt.Fprintln(os.Stderr, "Set the API key for your provider:")
+	fmt.Fprintln(os.Stderr, "  ANTHROPIC_API_KEY    for Anthropic (default)")
+	fmt.Fprintln(os.Stderr, "  OPENAI_API_KEY       for OpenAI / DeepSeek / compatible")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "Switch provider with MINI_CLAUDE_PROVIDER or --provider.")
 }
 
 func printUsage() {
@@ -140,7 +145,7 @@ Environment:
   OPENAI_BASE_URL        Custom OpenAI-compatible endpoint
 
 REPL Commands:
-  /help  /clear  /cost  /model  /compact  /skills  /memory  /exit`)
+  /help  /clear  /model  /compact  /skills  /memory  /exit`)
 }
 
 func fatal(format string, args ...interface{}) {

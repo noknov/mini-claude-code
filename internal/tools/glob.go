@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-const maxGlobResults = 200
+const maxGlobResults = 100
 
 var globSkipDirs = map[string]bool{
 	".git": true, "node_modules": true, "__pycache__": true,
@@ -103,7 +103,10 @@ func (t *GlobTool) Execute(input json.RawMessage, workDir string) (string, error
 	if len(matches) == 0 {
 		return "No files found matching pattern", nil
 	}
-	if len(matches) > maxGlobResults {
+
+	total := len(matches)
+	truncated := total > maxGlobResults
+	if truncated {
 		matches = matches[:maxGlobResults]
 	}
 
@@ -111,7 +114,11 @@ func (t *GlobTool) Execute(input json.RawMessage, workDir string) (string, error
 	for _, m := range matches {
 		sb.WriteString(m.path + "\n")
 	}
-	return fmt.Sprintf("Found %d file(s):\n%s", len(matches), sb.String()), nil
+	header := fmt.Sprintf("Found %d file(s):\n", total)
+	if truncated {
+		header = fmt.Sprintf("Found %d file(s), showing first %d:\n", total, maxGlobResults)
+	}
+	return header + sb.String(), nil
 }
 
 // matchGlob handles "**/" recursive patterns by splitting on "**/" and

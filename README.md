@@ -78,8 +78,7 @@ User input
 | **Runtime** | | |
 | `compact/compact.go` | 192 | Conversation compaction: auto-detect, full summarize, micro-trim |
 | `permission/permission.go` | 155 | Permission modes + settings rules + hook integration + classifier stub |
-| `session/session.go` | 87 | Message history + cost tracking |
-| `cost/cost.go` | 93 | Multi-model pricing lookup and cost estimation |
+| `session/session.go` | 80 | Message history + token tracking |
 | `sandbox/sandbox.go` | 67 | Bash sandbox stub (macOS/Linux) |
 | `history/history.go` | 137 | Session persistence + resume listing |
 | **Configuration** | | |
@@ -233,7 +232,6 @@ Configure in `.mcp.json`:
 | API retry + model fallback | ✅ | ✅ |
 | Non-interactive pipe mode | ✅ | ✅ |
 | Session persistence / resume | ✅ | ✅ (basic) |
-| Multi-model cost tracking | ✅ | ✅ |
 | System prompt caching boundary | ✅ | ✅ (designed) |
 | Sandbox stub | ✅ | ✅ (stub) |
 | Ctrl+C interruption | ✅ | ✅ |

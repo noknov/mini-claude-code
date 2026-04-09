@@ -38,9 +38,10 @@ func NewAnthropic(apiKey, model, baseURL string) *Anthropic {
 	}
 }
 
-func (a *Anthropic) Name() string      { return "anthropic" }
-func (a *Anthropic) Model() string     { return a.model }
-func (a *Anthropic) SetModel(m string) { a.model = m }
+func (a *Anthropic) Name() string       { return "anthropic" }
+func (a *Anthropic) Model() string      { return a.model }
+func (a *Anthropic) SetModel(m string)  { a.model = m }
+func (a *Anthropic) ContextWindow() int { return 200000 }
 
 func (a *Anthropic) SendStream(ctx context.Context, req Request) (<-chan StreamEvent, <-chan error) {
 	eventCh := make(chan StreamEvent, 64)

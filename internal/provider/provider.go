@@ -10,6 +10,7 @@ type Provider interface {
 	Name() string
 	Model() string
 	SetModel(model string)
+	ContextWindow() int
 
 	// SendStream sends a conversation and streams back events.
 	// The caller ranges over the returned channel; it is closed when the

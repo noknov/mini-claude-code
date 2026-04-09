@@ -1,13 +1,21 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 )
 
-const maxGrepLines = 5000
+const (
+	maxGrepMatches    = 250
+	maxGrepResultSize = 20000 // chars, aligned with Claude Code's persistence threshold
+	grepTimeout       = 20 * time.Second
+)
+
+var vcsDirectoriesToExclude = []string{".git", ".svn", ".hg", ".bzr", ".jj"}
 
 type GrepTool struct{}
 
@@ -72,22 +80,54 @@ func (t *GrepTool) Execute(input json.RawMessage, workDir string) (string, error
 }
 
 func runRipgrep(pattern, include, searchPath, workDir string) (string, error) {
-	args := []string{"-n", "--color=never", "--no-heading"}
-	if include != "" {
-		args = append(args, "--glob", include)
-	}
-	args = append(args, pattern, searchPath)
+	args := buildRipgrepArgs(pattern, include)
+	args = append(args, searchPath)
 
-	cmd := exec.Command("rg", args...)
+	ctx, cancel := context.WithTimeout(context.Background(), grepTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "rg", args...)
 	cmd.Dir = workDir
 	output, err := cmd.CombinedOutput()
+
+	if ctx.Err() == context.DeadlineExceeded {
+		result := truncateSearchOutput(string(output))
+		return result + "\n\n(search timed out, results may be incomplete)", nil
+	}
 	return handleSearchResult(string(output), err)
 }
 
+func buildRipgrepArgs(pattern, include string) []string {
+	args := []string{
+		"--hidden",
+		"--no-binary",
+		"-n", "--color=never", "--no-heading",
+		"--max-columns", "500",
+		"--max-columns-preview",
+	}
+	for _, dir := range vcsDirectoriesToExclude {
+		args = append(args, "--glob", "!"+dir)
+	}
+	if include != "" {
+		args = append(args, "--glob", include)
+	}
+	args = append(args, pattern)
+	return args
+}
+
 func runGrep(pattern, searchPath, workDir string) (string, error) {
-	cmd := exec.Command("grep", "-rn", "--color=never", pattern, searchPath)
+	ctx, cancel := context.WithTimeout(context.Background(), grepTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "grep", "-rn", "--color=never",
+		"--binary-files=without-match", pattern, searchPath)
 	cmd.Dir = workDir
 	output, err := cmd.CombinedOutput()
+
+	if ctx.Err() == context.DeadlineExceeded {
+		result := truncateSearchOutput(string(output))
+		return result + "\n\n(search timed out, results may be incomplete)", nil
+	}
 	return handleSearchResult(string(output), err)
 }
 
@@ -97,16 +137,30 @@ func handleSearchResult(output string, err error) (string, error) {
 			return "No matches found", nil
 		}
 		if output != "" {
-			return output, nil
+			return truncateSearchOutput(output), nil
 		}
 		return "", fmt.Errorf("search failed: %w", err)
 	}
+	return truncateSearchOutput(output), nil
+}
 
+func truncateSearchOutput(output string) string {
 	lines := strings.Split(output, "\n")
-	if len(lines) > maxGrepLines {
-		lines = lines[:maxGrepLines]
-		output = strings.Join(lines, "\n") +
-			fmt.Sprintf("\n... (truncated, showing first %d matches)", maxGrepLines)
+	truncated := false
+
+	if len(lines) > maxGrepMatches {
+		lines = lines[:maxGrepMatches]
+		truncated = true
 	}
-	return output, nil
+
+	result := strings.Join(lines, "\n")
+	if len(result) > maxGrepResultSize {
+		result = result[:maxGrepResultSize]
+		truncated = true
+	}
+
+	if truncated {
+		result += fmt.Sprintf("\n\n... (truncated, showing first %d matches out of more)", maxGrepMatches)
+	}
+	return result
 }

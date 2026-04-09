@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"math/rand"
 	"strings"
 	"time"
 
@@ -115,11 +116,12 @@ func forwardEvents(
 // ---------------------------------------------------------------------------
 
 func backoffDelay(attempt int, initial, maxDelay time.Duration) time.Duration {
-	delay := time.Duration(float64(initial) * math.Pow(2, float64(attempt-1)))
-	if delay > maxDelay {
-		delay = maxDelay
+	base := time.Duration(float64(initial) * math.Pow(2, float64(attempt-1)))
+	if base > maxDelay {
+		base = maxDelay
 	}
-	return delay
+	jitter := time.Duration(rand.Float64() * 0.25 * float64(base))
+	return base + jitter
 }
 
 func isRetryable(err error) bool {
@@ -127,10 +129,21 @@ func isRetryable(err error) bool {
 		return false
 	}
 	msg := err.Error()
+
+	// Client errors (4xx except 429) are never retryable
+	if strings.Contains(msg, "status 400") ||
+		strings.Contains(msg, "status 401") ||
+		strings.Contains(msg, "status 403") ||
+		strings.Contains(msg, "status 404") ||
+		strings.Contains(msg, "status 422") {
+		return false
+	}
+
 	return strings.Contains(msg, "status 429") ||
 		strings.Contains(msg, "status 500") ||
 		strings.Contains(msg, "status 502") ||
 		strings.Contains(msg, "status 503") ||
 		strings.Contains(msg, "status 529") ||
-		strings.Contains(msg, "overloaded")
+		strings.Contains(msg, "overloaded") ||
+		strings.Contains(msg, "connection reset")
 }

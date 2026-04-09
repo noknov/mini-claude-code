@@ -1,28 +1,26 @@
-// Package session manages conversation state: message history, token
-// accounting, and session identity.
+// Package session manages conversation state: message history and session identity.
 package session
 
 import (
 	"time"
 
-	"github.com/noknov/mini-claude-code/internal/cost"
 	"github.com/noknov/mini-claude-code/internal/provider"
 )
 
 // Session holds the conversation state.
 type Session struct {
-	ID        string
-	Title     string
-	CreatedAt time.Time
-	Messages  []provider.Message
-	Cost      *cost.Tracker
+	ID           string
+	Title        string
+	CreatedAt    time.Time
+	Messages     []provider.Message
+	InputTokens  int
+	OutputTokens int
 }
 
 func New(id string) *Session {
 	return &Session{
 		ID:        id,
 		CreatedAt: time.Now(),
-		Cost:      cost.NewTracker(),
 	}
 }
 
@@ -38,6 +36,9 @@ func (s *Session) AddUserMessage(text string) {
 }
 
 func (s *Session) AddAssistantMessage(blocks []provider.ContentBlock) {
+	if len(blocks) == 0 {
+		return
+	}
 	s.Messages = append(s.Messages, provider.Message{
 		Role:    "assistant",
 		Content: blocks,
@@ -65,16 +66,9 @@ func (s *Session) SetMessages(msgs []provider.Message) {
 // Usage tracking
 // ---------------------------------------------------------------------------
 
-func (s *Session) UpdateUsage(model string, inputTokens, outputTokens int) {
-	s.Cost.Add(model, inputTokens, outputTokens)
-}
-
-func (s *Session) TotalTokens() (input, output int) {
-	return s.Cost.TotalTokens()
-}
-
-func (s *Session) EstimateCost() float64 {
-	return s.Cost.EstimateCost()
+func (s *Session) UpdateUsage(inputTokens, outputTokens int) {
+	s.InputTokens += inputTokens
+	s.OutputTokens += outputTokens
 }
 
 // ---------------------------------------------------------------------------
@@ -83,5 +77,6 @@ func (s *Session) EstimateCost() float64 {
 
 func (s *Session) Clear() {
 	s.Messages = nil
-	s.Cost.Clear()
+	s.InputTokens = 0
+	s.OutputTokens = 0
 }

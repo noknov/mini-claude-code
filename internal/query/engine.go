@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
+	"sync/atomic"
 
 	"github.com/noknov/mini-claude-code/internal/compact"
 	"github.com/noknov/mini-claude-code/internal/config"
@@ -37,6 +39,7 @@ type Engine struct {
 	compactor  *compact.Compactor
 	retryCfg   retry.Config
 	cancelFunc context.CancelFunc // set per-turn for Ctrl+C interruption
+	running    atomic.Bool
 }
 
 func NewEngine(
@@ -79,9 +82,8 @@ func (e *Engine) wireAgentTool() {
 // REPLEngine interface
 // ---------------------------------------------------------------------------
 
-func (e *Engine) SessionInfo() (inputTokens, outputTokens int, cost float64) {
-	in, out := e.session.TotalTokens()
-	return in, out, e.session.EstimateCost()
+func (e *Engine) SessionInfo() (inputTokens, outputTokens int) {
+	return e.session.InputTokens, e.session.OutputTokens
 }
 
 func (e *Engine) ClearSession()     { e.session.Clear() }
@@ -95,23 +97,39 @@ func (e *Engine) Cancel() {
 	}
 }
 
+// IsRunning reports whether the engine is currently processing a query.
+func (e *Engine) IsRunning() bool {
+	return e.running.Load()
+}
+
 // ---------------------------------------------------------------------------
 // Main query loop
 // ---------------------------------------------------------------------------
 
 // Run processes a user message through the full tool-use loop.
 func (e *Engine) Run(userInput string, terminal *ui.Terminal) {
+	e.running.Store(true)
+	defer e.running.Store(false)
+
 	e.session.AddUserMessage(userInput)
-	e.autoCompactIfNeeded(terminal)
 
 	for {
-		resp := e.callAPI(terminal)
+		e.compactIfNeeded(terminal)
+
+		resp, apiErr := e.callAPI(terminal)
+		if apiErr != nil {
+			if e.reactiveCompact(apiErr, terminal) {
+				continue
+			}
+			terminal.PrintError(fmt.Errorf("API error: %w", apiErr))
+			return
+		}
 		if resp == nil {
 			return
 		}
 
 		e.session.AddAssistantMessage(resp.ContentBlocks)
-		e.session.UpdateUsage(resp.Model, resp.InputTokens, resp.OutputTokens)
+		e.session.UpdateUsage(resp.InputTokens, resp.OutputTokens)
 
 		calls := extractToolCalls(resp.ContentBlocks)
 		if len(calls) == 0 {
@@ -120,6 +138,31 @@ func (e *Engine) Run(userInput string, terminal *ui.Terminal) {
 
 		e.executeTools(calls, terminal)
 	}
+}
+
+// reactiveCompact handles prompt-too-long errors by forcing compaction and retrying.
+func (e *Engine) reactiveCompact(apiErr error, terminal *ui.Terminal) bool {
+	msg := apiErr.Error()
+	if !isContextOverflow(msg) {
+		return false
+	}
+
+	terminal.PrintInfo("Context overflow detected, forcing compaction...")
+	compacted, err := e.compactor.Compact(context.Background(), e.session.Messages)
+	if err != nil {
+		return false
+	}
+	e.session.SetMessages(compacted)
+	terminal.PrintSuccess("Conversation compacted (reactive)")
+	return true
+}
+
+func isContextOverflow(msg string) bool {
+	return strings.Contains(msg, "maximum context length") ||
+		strings.Contains(msg, "prompt is too long") ||
+		strings.Contains(msg, "too many tokens") ||
+		strings.Contains(msg, "context_length_exceeded") ||
+		(strings.Contains(msg, "requested") && strings.Contains(msg, "tokens"))
 }
 
 // ---------------------------------------------------------------------------
@@ -159,19 +202,31 @@ func (e *Engine) checkPermission(t tool.Tool, tc toolCall, terminal *ui.Terminal
 	return e.perm.CheckWithHookDecision(hookDecision, tc.Name, desc, terminal)
 }
 
+const maxToolResultLen = 80000 // ~20K tokens, prevents single tool from blowing up context
+
 func (e *Engine) runPostHooksAndRecord(t tool.Tool, tc toolCall, terminal *ui.Terminal) {
 	result, err := e.registry.Execute(tc.Name, tc.Input, e.cfg.WorkDir)
 
-	// Run post-tool hooks
 	e.hooks.Run(hooks.PostToolUse, tc.Name, tc.Input)
 
 	if err != nil {
 		e.session.AddToolResult(tc.ID, err.Error(), true)
 		terminal.PrintToolError(tc.Name, err)
 	} else {
-		e.session.AddToolResult(tc.ID, result, false)
 		terminal.PrintToolResult(tc.Name, result)
+		if result == "" {
+			result = fmt.Sprintf("(%s completed with no output)", tc.Name)
+		}
+		e.session.AddToolResult(tc.ID, truncateToolResult(result), false)
 	}
+}
+
+func truncateToolResult(s string) string {
+	if len(s) <= maxToolResultLen {
+		return s
+	}
+	half := maxToolResultLen / 2
+	return s[:half] + "\n\n... [truncated: output too large] ...\n\n" + s[len(s)-half:]
 }
 
 func (e *Engine) recordToolError(id, name, msg string, terminal *ui.Terminal) {
@@ -183,7 +238,7 @@ func (e *Engine) recordToolError(id, name, msg string, terminal *ui.Terminal) {
 // API call with retry + streaming
 // ---------------------------------------------------------------------------
 
-func (e *Engine) callAPI(terminal *ui.Terminal) *provider.Response {
+func (e *Engine) callAPI(terminal *ui.Terminal) (*provider.Response, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	e.cancelFunc = cancel
 	defer func() { e.cancelFunc = nil }()
@@ -202,7 +257,7 @@ func (e *Engine) consumeStream(
 	eventCh <-chan provider.StreamEvent,
 	errCh <-chan error,
 	terminal *ui.Terminal,
-) *provider.Response {
+) (*provider.Response, error) {
 	var resp provider.Response
 	streaming := false
 
@@ -213,7 +268,7 @@ func (e *Engine) consumeStream(
 				if streaming {
 					terminal.StopStreaming()
 				}
-				return &resp
+				return &resp, nil
 			}
 			streaming = e.handleStreamEvent(evt, &resp, streaming, terminal)
 
@@ -222,8 +277,7 @@ func (e *Engine) consumeStream(
 				if streaming {
 					terminal.StopStreaming()
 				}
-				terminal.PrintError(fmt.Errorf("API error: %w", err))
-				return nil
+				return nil, err
 			}
 		}
 	}
@@ -262,13 +316,10 @@ func (e *Engine) handleStreamEvent(
 }
 
 // ---------------------------------------------------------------------------
-// Auto-compaction
+// Auto-compaction (runs before every API call)
 // ---------------------------------------------------------------------------
 
-func (e *Engine) autoCompactIfNeeded(terminal *ui.Terminal) {
-	if !e.ctx.Settings.IsAutoCompactEnabled() {
-		return
-	}
+func (e *Engine) compactIfNeeded(terminal *ui.Terminal) {
 	if !e.compactor.ShouldCompact(e.session.Messages) {
 		return
 	}
@@ -276,15 +327,16 @@ func (e *Engine) autoCompactIfNeeded(terminal *ui.Terminal) {
 	terminal.PrintInfo("Auto-compacting conversation...")
 	e.hooks.Run(hooks.PreCompact, "", nil)
 
-	msgs, err := e.compactor.Compact(context.Background(), e.session.Messages)
+	msgs, compacted, err := e.compactor.EnsureWithinLimit(context.Background(), e.session.Messages)
 	if err != nil {
 		terminal.PrintError(fmt.Errorf("compact failed: %w", err))
 		return
 	}
-
-	e.session.SetMessages(msgs)
-	e.hooks.Run(hooks.PostCompact, "", nil)
-	terminal.PrintSuccess("Conversation compacted")
+	if compacted {
+		e.session.SetMessages(msgs)
+		e.hooks.Run(hooks.PostCompact, "", nil)
+		terminal.PrintSuccess("Conversation compacted")
+	}
 }
 
 // ---------------------------------------------------------------------------

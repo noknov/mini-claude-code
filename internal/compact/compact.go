@@ -14,39 +14,69 @@ import (
 )
 
 const (
-	charsPerToken        = 4
-	defaultContextWindow = 200000
-	summaryReserve       = 20000
+	charsPerToken     = 4
+	summaryReserve    = 20000 // tokens reserved for the compact summarizer output
+	autoCompactBuffer = 13000 // headroom before triggering compact
 )
 
 // ---------------------------------------------------------------------------
 // Compactor
 // ---------------------------------------------------------------------------
 
-// Compactor handles conversation compaction at multiple levels.
 type Compactor struct {
 	provider      provider.Provider
 	contextWindow int
 }
 
 func New(prov provider.Provider) *Compactor {
-	return &Compactor{provider: prov, contextWindow: defaultContextWindow}
+	return &Compactor{
+		provider:      prov,
+		contextWindow: prov.ContextWindow(),
+	}
 }
 
 // ---------------------------------------------------------------------------
-// Auto-compact check
+// Threshold check
 // ---------------------------------------------------------------------------
 
-// ShouldCompact estimates whether the conversation needs compaction.
 func (c *Compactor) ShouldCompact(messages []provider.Message) bool {
-	return c.estimateTokens(messages) > c.contextWindow-summaryReserve
+	effectiveWindow := c.contextWindow - summaryReserve
+	return c.estimateTokens(messages) > effectiveWindow-autoCompactBuffer
+}
+
+func (c *Compactor) EstimateTokens(messages []provider.Message) int {
+	return c.estimateTokens(messages)
+}
+
+// ---------------------------------------------------------------------------
+// EnsureWithinLimit performs compaction as many times as needed
+// to bring messages under the context window. Returns the
+// (possibly compacted) messages.
+// ---------------------------------------------------------------------------
+
+func (c *Compactor) EnsureWithinLimit(ctx context.Context, messages []provider.Message) ([]provider.Message, bool, error) {
+	if !c.ShouldCompact(messages) {
+		return messages, false, nil
+	}
+
+	// First try micro-compact (cheap, no LLM call)
+	messages = c.MicroCompact(messages)
+	if !c.ShouldCompact(messages) {
+		return messages, true, nil
+	}
+
+	// Full compact (LLM summarization)
+	compacted, err := c.Compact(ctx, messages)
+	if err != nil {
+		return messages, false, err
+	}
+	return compacted, true, nil
 }
 
 // ---------------------------------------------------------------------------
 // Full compact
 // ---------------------------------------------------------------------------
 
-// Compact summarizes older messages, keeping recent ones intact.
 func (c *Compactor) Compact(ctx context.Context, messages []provider.Message) ([]provider.Message, error) {
 	if len(messages) < 4 {
 		return messages, nil
@@ -80,16 +110,16 @@ func buildCompactedMessages(summary string, recent []provider.Message) []provide
 // Micro-compact (trim old tool results without full summarization)
 // ---------------------------------------------------------------------------
 
-// MicroCompact trims old tool results to save tokens.
 func (c *Compactor) MicroCompact(messages []provider.Message) []provider.Message {
-	if len(messages) < 10 {
+	if len(messages) < 6 {
 		return messages
 	}
 
 	result := make([]provider.Message, len(messages))
 	copy(result, messages)
 
-	boundary := len(result) / 2
+	// Trim all but the most recent 4 messages
+	boundary := len(result) - 4
 	for i := 0; i < boundary; i++ {
 		trimToolResults(&result[i])
 	}
@@ -133,7 +163,11 @@ func formatConversation(messages []provider.Message) string {
 		for _, b := range m.Content {
 			switch b.Type {
 			case "text":
-				sb.WriteString(b.Text)
+				text := b.Text
+				if len(text) > 500 {
+					text = text[:500] + "..."
+				}
+				sb.WriteString(text)
 			case "tool_use":
 				fmt.Fprintf(&sb, "[Called tool: %s]", b.Name)
 			case "tool_result":
