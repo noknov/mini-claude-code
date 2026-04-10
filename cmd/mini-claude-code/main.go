@@ -42,8 +42,11 @@ func main() {
 	}
 
 	terminal := ui.NewTerminal(cfg, ctx.Skills)
+	terminal.InitLiner()
+	defer terminal.Close()
+
 	terminal.PrintWelcome(version, prov.Name(), prov.Model(), cfg.WorkDir)
-	setupSignalHandler(engine)
+	setupSignalHandler(engine, terminal)
 	terminal.RunREPL(engine)
 }
 
@@ -92,7 +95,7 @@ func runNonInteractive(engine *query.Engine, prompt string) {
 // Signal handling
 // ---------------------------------------------------------------------------
 
-func setupSignalHandler(engine *query.Engine) {
+func setupSignalHandler(engine *query.Engine, terminal *ui.Terminal) {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -100,6 +103,7 @@ func setupSignalHandler(engine *query.Engine) {
 			if engine.IsRunning() {
 				engine.Cancel()
 			} else {
+				terminal.Close()
 				fmt.Println("\nGoodbye!")
 				os.Exit(0)
 			}

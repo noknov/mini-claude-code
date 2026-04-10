@@ -3,11 +3,15 @@
 package ui
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
+	"syscall"
+	"time"
+	"unsafe"
+
+	"github.com/peterh/liner"
 
 	"github.com/noknov/mini-claude-code/internal/config"
 	"github.com/noknov/mini-claude-code/internal/skills"
@@ -30,94 +34,164 @@ const (
 
 // Terminal handles all user-facing I/O.
 type Terminal struct {
-	cfg       *config.Config
-	reader    *bufio.Reader
-	streaming bool
-	skills    []skills.Skill
+	cfg            *config.Config
+	liner          *liner.State
+	streaming      bool
+	lastStreamChar byte
+	skills         []skills.Skill
+	lastCtrlC      int64 // unix timestamp of last Ctrl+C
 }
 
 func NewTerminal(cfg *config.Config, sk []skills.Skill) *Terminal {
 	return &Terminal{
 		cfg:    cfg,
-		reader: bufio.NewReader(os.Stdin),
 		skills: sk,
 	}
 }
 
+// InitLiner creates the liner instance (enters raw mode).
+// Must call Close before exit.
+func (t *Terminal) InitLiner() {
+	t.liner = liner.NewLiner()
+	t.liner.SetCtrlCAborts(true)
+	t.liner.SetBeep(false)
+}
+
+// Close restores the terminal to its original state.
+func (t *Terminal) Close() {
+	if t.liner != nil {
+		t.liner.Close()
+	}
+}
+
 // ---------------------------------------------------------------------------
-// Display
+// Display — all output goes through writeln / writeRaw to handle raw mode.
 // ---------------------------------------------------------------------------
 
 func (t *Terminal) PrintWelcome(version, providerName, model, workDir string) {
-	fmt.Printf("\n%s%s mini-claude-code%s v%s\n", bold, cyan, reset, version)
-	fmt.Printf("  Provider: %s\n", providerName)
-	fmt.Printf("  Model:    %s%s%s\n", bold, model, reset)
-	fmt.Printf("  Dir:      %s\n", workDir)
-	fmt.Printf("  %sTip: /help for commands, Ctrl+C to exit%s\n\n", dim, reset)
+	t.writeln("")
+	t.writeln(bold + cyan + " mini-claude-code" + reset + " v" + version)
+	t.writeln("  Provider: " + providerName)
+	t.writeln("  Model:    " + bold + model + reset)
+	t.writeln("  Dir:      " + workDir)
+	t.writeln("  " + dim + "Tip: /help for commands, Ctrl+C to exit" + reset)
+	t.writeln("")
+}
+
+// writeln writes a line, converting \n to \r\n when liner is active (raw mode).
+func (t *Terminal) writeln(s string) {
+	if t.liner != nil {
+		s = strings.ReplaceAll(s, "\n", "\r\n")
+		os.Stdout.WriteString(s + "\r\n")
+	} else {
+		fmt.Println(s)
+	}
+}
+
+// writeRaw writes text directly, converting \n to \r\n when liner is active.
+func (t *Terminal) writeRaw(s string) {
+	if t.liner != nil {
+		s = strings.ReplaceAll(s, "\n", "\r\n")
+	}
+	os.Stdout.WriteString(s)
 }
 
 func (t *Terminal) ReadInput() (string, error) {
-	fmt.Printf("%s> %s", green, reset)
-	line, err := t.reader.ReadString('\n')
+	if t.liner == nil {
+		return "", fmt.Errorf("terminal not initialized")
+	}
+	drainStdin()
+	input, err := t.liner.Prompt("> ")
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(line), nil
+	input = strings.TrimSpace(input)
+	if input != "" {
+		t.liner.AppendHistory(input)
+	}
+	return input, nil
 }
 
-func (t *Terminal) StartStreaming()        { t.streaming = true; fmt.Print("\n") }
-func (t *Terminal) StreamText(text string) { fmt.Print(text) }
+// drainStdin discards any buffered bytes in the kernel's terminal input
+// queue using TIOCFLUSH. This is safe to call while liner's goroutine is
+// running because it operates at the kernel tty layer, not the fd flags.
+func drainStdin() {
+	fd := os.Stdin.Fd()
+	what := 1 // FREAD: flush the read queue only
+	syscall.Syscall(syscall.SYS_IOCTL, fd, _TIOCFLUSH, uintptr(unsafe.Pointer(&what)))
+}
+
+// TIOCFLUSH on darwin: _IOW('t', 16, int) = 0x80047410
+const _TIOCFLUSH = 0x80047410
+
+func (t *Terminal) StartStreaming() { t.streaming = true; t.lastStreamChar = 0 }
+func (t *Terminal) StreamText(text string) {
+	if len(text) > 0 {
+		t.lastStreamChar = text[len(text)-1]
+	}
+	t.writeRaw(text)
+}
 func (t *Terminal) StopStreaming() {
 	if t.streaming {
-		fmt.Println()
+		if t.lastStreamChar != '\n' {
+			t.writeRaw("\n")
+		}
+		t.writeRaw("\n")
 		t.streaming = false
 	}
 }
 
 func (t *Terminal) PrintToolUse(name string, input interface{}) {
-	fmt.Printf("\n%s> %s%s %s%s%s\n", yellow, name, reset, dim, formatToolInput(input), reset)
+	t.writeln("")
+	t.writeln(yellow + "> " + name + reset + " " + dim + formatToolInput(input) + reset)
 }
 
 func (t *Terminal) PrintToolResult(name, result string) {
 	lines := strings.Split(result, "\n")
 	if len(lines) > 10 {
 		for _, l := range lines[:5] {
-			fmt.Printf("  %s%s%s\n", dim, l, reset)
+			t.writeln("  " + dim + l + reset)
 		}
-		fmt.Printf("  %s... (%d more lines)%s\n", dim, len(lines)-5, reset)
+		t.writeln(fmt.Sprintf("  %s... (%d more lines)%s", dim, len(lines)-5, reset))
 	} else if result != "" {
 		for _, l := range lines {
-			fmt.Printf("  %s%s%s\n", dim, l, reset)
+			t.writeln("  " + dim + l + reset)
 		}
 	}
 }
 
 func (t *Terminal) PrintToolError(name string, err error) {
-	fmt.Printf("  %s✗ %s: %v%s\n", red, name, err, reset)
+	t.writeln(fmt.Sprintf("  %s✗ %s: %v%s", red, name, err, reset))
 }
 
 func (t *Terminal) PrintToolDenied(name string) {
-	fmt.Printf("  %s⊘ %s: denied%s\n", yellow, name, reset)
+	t.writeln(fmt.Sprintf("  %s⊘ %s: denied%s", yellow, name, reset))
 }
 
 func (t *Terminal) PrintError(err error) {
-	fmt.Printf("%s✗ Error: %v%s\n", red, err, reset)
+	t.writeln(fmt.Sprintf("%s✗ Error: %v%s", red, err, reset))
 }
 
 func (t *Terminal) PrintInfo(msg string) {
-	fmt.Printf("%s%s%s\n", dim, msg, reset)
+	t.writeln(dim + msg + reset)
 }
 
 func (t *Terminal) PrintSuccess(msg string) {
-	fmt.Printf("%s✓ %s%s\n", green, msg, reset)
+	t.writeln(green + "✓ " + msg + reset)
 }
 
 // AskPermission implements the permission.Asker interface.
 func (t *Terminal) AskPermission(toolName, description string) string {
-	fmt.Printf("\n%s? %s%s\n", yellow, description, reset)
-	fmt.Printf("  %sAllow? [Y/n/a(lways)] %s", dim, reset)
-	line, _ := t.reader.ReadString('\n')
-	return strings.TrimSpace(line)
+	t.writeln("")
+	t.writeln(yellow + "? " + description + reset)
+	if t.liner == nil {
+		return "y"
+	}
+	input, err := t.liner.Prompt("  Allow? [Y/n/a(lways)] ")
+	if err != nil {
+		return "y"
+	}
+	return strings.TrimSpace(input)
 }
 
 // ---------------------------------------------------------------------------
@@ -138,8 +212,19 @@ func (t *Terminal) RunREPL(engine REPLEngine) {
 	for {
 		input, err := t.ReadInput()
 		if err != nil {
+			if err == liner.ErrPromptAborted {
+				now := time.Now().UnixMilli()
+				if now-t.lastCtrlC < 800 {
+					t.writeln("Goodbye!")
+					return
+				}
+				t.lastCtrlC = now
+				t.writeln(dim + "  Press Ctrl-C again to exit" + reset)
+				continue
+			}
 			break
 		}
+		t.lastCtrlC = 0
 		if input == "" {
 			continue
 		}
@@ -182,10 +267,9 @@ func (t *Terminal) handleCommand(input string, engine REPLEngine) bool {
 	case "/resume":
 		t.PrintInfo("Session resume: not yet implemented")
 	case "/exit", "/quit":
-		fmt.Println("Goodbye!")
+		t.writeln("Goodbye!")
 		os.Exit(0)
 	default:
-		// Check if it's a skill invocation
 		if t.trySkillInvocation(cmd, engine) {
 			return true
 		}
@@ -196,9 +280,11 @@ func (t *Terminal) handleCommand(input string, engine REPLEngine) bool {
 
 func (t *Terminal) printTokenUsage(engine REPLEngine) {
 	in, out := engine.SessionInfo()
-	fmt.Printf("\n%sToken Usage:%s\n", bold, reset)
-	fmt.Printf("  Input:  %d tokens\n", in)
-	fmt.Printf("  Output: %d tokens\n\n", out)
+	t.writeln("")
+	t.writeln(bold + "Token Usage:" + reset)
+	t.writeln(fmt.Sprintf("  Input:  %d tokens", in))
+	t.writeln(fmt.Sprintf("  Output: %d tokens", out))
+	t.writeln("")
 }
 
 func (t *Terminal) handleModelCommand(parts []string, engine REPLEngine) {
@@ -206,7 +292,7 @@ func (t *Terminal) handleModelCommand(parts []string, engine REPLEngine) {
 		engine.SetModel(parts[1])
 		t.PrintSuccess(fmt.Sprintf("Model set to %s", parts[1]))
 	} else {
-		fmt.Printf("Current model: %s\n", engine.GetModel())
+		t.writeln("Current model: " + engine.GetModel())
 	}
 }
 
@@ -215,11 +301,12 @@ func (t *Terminal) printSkills() {
 		t.PrintInfo("No skills loaded. Add .md files to .claude/commands/ to create skills.")
 		return
 	}
-	fmt.Printf("\n%sAvailable skills:%s\n", bold, reset)
+	t.writeln("")
+	t.writeln(bold + "Available skills:" + reset)
 	for _, s := range t.skills {
-		fmt.Printf("  /%s\n", s.Name)
+		t.writeln("  /" + s.Name)
 	}
-	fmt.Println()
+	t.writeln("")
 }
 
 func (t *Terminal) trySkillInvocation(cmd string, engine REPLEngine) bool {
@@ -234,26 +321,25 @@ func (t *Terminal) trySkillInvocation(cmd string, engine REPLEngine) bool {
 }
 
 func (t *Terminal) printHelp() {
-	fmt.Printf(`
-%sCommands:%s
-  /help          Show this help
-  /clear         Clear conversation history
-  /cost          Show token usage and estimated cost
-  /model [name]  Show or change the current model
-  /compact       Compress conversation context
-  /memory        Show memory file info
-  /skills        List available skills
-  /permissions   Show permission mode
-  /resume        Resume a previous session
-  /exit          Exit the program
-
-%sSkills:%s
-  /skill-name    Run a skill from .claude/commands/
-
-%sKeyboard:%s
-  Ctrl+C         Interrupt current operation / Exit
-
-`, bold, reset, bold, reset, bold, reset)
+	t.writeln("")
+	t.writeln(bold + "Commands:" + reset)
+	t.writeln("  /help          Show this help")
+	t.writeln("  /clear         Clear conversation history")
+	t.writeln("  /cost          Show token usage")
+	t.writeln("  /model [name]  Show or change the current model")
+	t.writeln("  /compact       Compress conversation context")
+	t.writeln("  /memory        Show memory file info")
+	t.writeln("  /skills        List available skills")
+	t.writeln("  /permissions   Show permission mode")
+	t.writeln("  /resume        Resume a previous session")
+	t.writeln("  /exit          Exit the program")
+	t.writeln("")
+	t.writeln(bold + "Skills:" + reset)
+	t.writeln("  /skill-name    Run a skill from .claude/commands/")
+	t.writeln("")
+	t.writeln(bold + "Keyboard:" + reset)
+	t.writeln("  Ctrl+C         Interrupt current operation / Exit")
+	t.writeln("")
 }
 
 // ---------------------------------------------------------------------------

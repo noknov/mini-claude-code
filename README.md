@@ -1,44 +1,48 @@
 # mini-claude-code
 
-A minimal reimplementation of [Claude Code](https://docs.anthropic.com/en/docs/claude-code) in Go. ~5400 lines, single binary, zero dependencies.
+A minimal reimplementation of [Claude Code](https://docs.anthropic.com/en/docs/claude-code) in Go. ~5400 lines, single binary, minimal dependencies.
 
 ## Architecture
 
 ```
 User input
-  │
-  ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  main.go — Entry point                                              │
-│  Parses flags, loads config, gathers context, creates provider,     │
-│  starts REPL (interactive) or runs single prompt (pipe mode -p).    │
-└──────────────────────────┬──────────────────────────────────────────┘
-                           │
-  ┌────────────────────────┼────────────────────────────────┐
-  ▼                        ▼                                ▼
-┌──────────────┐    ┌──────────────────────────────┐  ┌──────────────┐
-│  ui/terminal │    │  query/engine — core loop     │  │  context/    │
-│              │    │                                │  │              │
-│  • REPL      │◄──►│  1. Build system prompt        │  │  Gathers:    │
-│  • Streaming │    │  2. Auto-compact if needed     │  │  • OS/Shell  │
-│  • /commands │    │  3. Send to provider (retry)   │  │  • Git status│
-│  • Permission│    │  4. Parse streaming response   │  │  • Memory    │
-│    prompts   │    │  5. Execute tools (with hooks) │  │  • Rules     │
-│  • Skill     │    │  6. Loop until no more tools   │  │  • Skills    │
-│    invocation│    │                                │  │  • Agents    │
-└──────────────┘    └──────────────────────────────┘  │  • MCP       │
-                           │                           │  • Settings  │
-         ┌─────────────────┼─────────────────┐         └──────────────┘
-         ▼                 ▼                 ▼
-  ┌────────────┐  ┌──────────────┐  ┌──────────────┐
-  │ provider/  │  │ session/     │  │ permission/  │
-  │            │  │              │  │              │
-  │ Anthropic  │  │ Messages     │  │ ask/auto/    │
-  │ OpenAI     │  │ Cost tracker │  │ deny/plan    │
-  │ (any       │  │ Session ID   │  │ Rules file   │
-  │  compat.)  │  │              │  │ Hook-based   │
-  └────────────┘  └──────────────┘  │ Classifier   │
-                                    └──────────────┘
+  |
+  v
++----------------------------------------------------------------------+
+| main.go -- Entry point                                               |
+| Parses flags, loads config, creates provider,                        |
+| starts REPL or runs single prompt (pipe -p).                         |
++-----------------------------------+----------------------------------+
+                                    |
+  +---------------------------------+--------------------------------+
+  |                                 |                                |
+  v                                 v                                v
++--------------+  +----------------------------------+  +--------------+
+| ui/terminal  |  | query/engine -- core loop        |  | context/     |
+|              |  |                                  |  |              |
+| * REPL       |<>| 1. Build system prompt           |  | Gathers:     |
+| * Streaming  |  | 2. Auto-compact if needed        |  | * OS/Shell   |
+| * /commands  |  | 3. Send to provider (retry)      |  | * Git status |
+| * Permission |  | 4. Parse streaming response      |  | * Memory     |
+|   prompts    |  | 5. Execute tools (with hooks)    |  | * Rules      |
+| * Skill      |  | 6. Loop until no more tools      |  | * Skills     |
+|   invocation |  |                                  |  | * Agents     |
+| * Ctrl+C     |  +----------------+-----------------+  | * MCP        |
+|   handling   |                   |                    | * Settings   |
++--------------+                   |                    +--------------+
+                                   |
+            +----------------------+---------------------+
+            |                      |                     |
+            v                      v                     v
+      +------------+      +--------------+      +--------------+
+      | provider   |      | session      |      | permission   |
+      |            |      |              |      |              |
+      | Anthropic  |      | Messages     |      | ask/auto/    |
+      | OpenAI     |      | Token        |      | deny/plan    |
+      | (any       |      | tracking     |      | Rules file   |
+      | compat.)   |      | Session ID   |      | Hook-based   |
+      +------------+      +--------------+      | Classifier   |
+                                                +--------------+
 ```
 
 ## Module Map
@@ -78,7 +82,7 @@ User input
 | **Runtime** | | |
 | `compact/compact.go` | 192 | Conversation compaction: auto-detect, full summarize, micro-trim |
 | `permission/permission.go` | 155 | Permission modes + settings rules + hook integration + classifier stub |
-| `session/session.go` | 80 | Message history + token tracking |
+| `session/session.go` | 80 | Message history + token tracking (no cost estimation) |
 | `sandbox/sandbox.go` | 67 | Bash sandbox stub (macOS/Linux) |
 | `history/history.go` | 137 | Session persistence + resume listing |
 | **Configuration** | | |
@@ -86,14 +90,20 @@ User input
 | `settings/settings.go` | 136 | Multi-layer settings merge (managed/user/project/local) |
 | `context/context.go` | 120 | System/project context gathering |
 | **UI** | | |
-| `ui/terminal.go` | 278 | REPL, streaming, slash commands, skill invocation, permission prompts |
+| `ui/terminal.go` | 366 | REPL (liner-based with CJK support), streaming, slash commands, Ctrl+C double-press exit, permission prompts |
 
 ## Quick Start
 
 ```bash
 export ANTHROPIC_API_KEY="your-key-here"
-go build -o mini-claude-code ./cmd/mini-claude-code
-./mini-claude-code
+go build -o ~/go/bin/mcc ./cmd/mini-claude-code
+mcc
+```
+
+Or run directly:
+
+```bash
+go run ./cmd/mini-claude-code
 ```
 
 ### OpenAI / Compatible Endpoints
